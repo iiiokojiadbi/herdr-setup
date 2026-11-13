@@ -1,9 +1,9 @@
 import { argv } from './argv';
 import { parse, terminal, firstMessage } from './parse';
 import { Fault, failure, success, type Data, type Effect, type Envelope } from './errors';
-import { hash, journalKey, prune, type Journal, type Entry } from './journal';
+import { hash, journalKey, writeEntry, type Journal, type Entry } from './journal';
 import type { Transport } from './transport';
-export interface Context { self?: string; parent?: string; cwd: string; hcExecutable?: string }
+export interface Context { sessionId: string; self?: string; parent?: string; cwd: string; hcExecutable?: string }
 export function text(value: unknown, label: string, max = 32768): asserts value is string {
   if (typeof value !== 'string' || !value.trim() || value.length > max || value.includes('\0')) throw new Fault('INVALID_INPUT',`Invalid ${label}.`);
 }
@@ -47,27 +47,26 @@ export function createClient({ transport, context, journal }: {transport: Transp
       if (input.blocker !== undefined && typeof input.blocker !== 'boolean') throw new Fault('INVALID_INPUT','Invalid blocker.');
       if (!journal) throw new Fault('HC_ERROR','Delivery journal unavailable.');
       const implicit = input.requestId === undefined;
-      const payload = `${kind}:\n${input.text}`;
-      const requestId = input.requestId ?? hash(payload);
-      const key = journalKey(context.self!,context.parent!,requestId);
+      const payloadHash = hash(`${kind}:\n${input.text}`);
+      const requestId = input.requestId ?? payloadHash;
+      const key = journalKey(context.self!,context.sessionId,context.parent!,requestId);
       const now = Date.now();
       const old = await journal.get(key);
       if (old && now-old.timestamp < (implicit ? 60000 : 7*86400000)) {
-        if (old.payload !== payload) return failure('REQUEST_ID_CONFLICT','requestId already has another payload.');
+        if (old.payloadHash !== payloadHash) return failure('REQUEST_ID_CONFLICT','requestId already has another payload.');
         if (old.status === 'sent' && old.result) return { ...old.result, data: { ...old.result.data, duplicate: true } };
         return failure(old.status === 'pending' ? 'DELIVERY_PENDING' : 'DELIVERY_UNKNOWN','Previous delivery outcome is unknown.','unknown',{address:context.parent,requestId,duplicate:true});
       }
-      const entry: Entry = {sender:context.self!,recipient:context.parent!,requestId,payload,timestamp:now,implicit,status:'pending'};
-      await journal.set(key,entry);
+      const entry: Entry = {sender:context.self!,sessionId:context.sessionId,recipient:context.parent!,requestId,payloadHash,timestamp:now,implicit,status:'pending'};
+      await writeEntry(journal,key,entry);
       const data = {address:context.parent,delivery:'sent',requestId,duplicate:false};
       try {
         await run(argv.send(context.parent!,`${kind} [${requestId}]:\n${input.text}`),'unknown');
         const result = success(data);
-        await journal.set(key,{...entry,status:'sent',result});
-        await prune(journal);
+        await writeEntry(journal,key,{...entry,status:'sent',result});
         return result;
       } catch (error) {
-        try { await journal.set(key,{...entry,status:'unknown'}); } catch {}
+        try { await writeEntry(journal,key,{...entry,status:'unknown'}); } catch {}
         return failure('DELIVERY_UNKNOWN','Parent delivery outcome is unknown.','unknown',{...data,delivery:'unknown'},error instanceof Fault ? error.details ?? error.message : String(error));
       }
     });
@@ -80,7 +79,10 @@ export function createClient({ transport, context, journal }: {transport: Transp
       const byTemplate = input.template !== undefined;
       if (byTemplate) { text(input.template,'template',256); text(input.task,'task'); if (input.template.startsWith('-') || input.command !== undefined) throw new Fault('INVALID_INPUT','Invalid launch mode.'); }
       else if (!Array.isArray(input.command) || !input.command.length || input.task !== undefined) throw new Fault('INVALID_INPUT','Provide template and task or command argv.');
-      if (!byTemplate) for (const arg of input.command) text(arg,'command argument');
+      if (!byTemplate) {
+        for (const arg of input.command) text(arg,'command argument');
+        if (input.command.length === 1 && /[\s;|&$`()<>'"\\]/u.test(input.command[0])) throw new Fault('INVALID_INPUT','A single command element must be a plain executable without whitespace or shell characters.');
+      }
       if (input.cwd !== undefined && input.worktree !== undefined) throw new Fault('INVALID_INPUT','cwd and worktree are exclusive.');
       const cwd = input.worktree ?? input.cwd ?? context.cwd;
       text(cwd,'cwd'); if (!cwd.startsWith('/')) throw new Fault('INVALID_INPUT','cwd must be absolute.');

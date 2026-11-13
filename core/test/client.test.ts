@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { createClient } from '../src/client';
 import { argv } from '../src/argv';
 import { terminal } from '../src/parse';
-import { prune, journalKey } from '../src/journal';
+import { prune, journalKey, hash, writeEntry, entryBytes, journalBudgetBytes } from '../src/journal';
 import { register as ownerRegister } from '../../mods/orchestrator/src/register';
 import { register as workerRegister } from '../../mods/worker/src/register';
-const context = {self:'t1',cwd:'/repo'};
+const context = {self:'t1',cwd:'/repo',sessionId:'session-1'};
 const child = {address:'t2',parent:'t1',state:'live',status:{app:'runner',state:'idle'},cwd:'/repo'};
 const output = (data: unknown, extra = {}) => ({exitCode:0,stdout:JSON.stringify(data),stderr:'',isStdoutTruncated:false,isStderrTruncated:false,...extra});
 function fake(responses: any[], ctx = context, journal?: any) {
@@ -116,19 +116,19 @@ test('failed report remains unknown across client recreation',async()=>{
   const second=fake([],{...context,parent:'t0'},journal);assert.equal((await second.client.askOwner({text:'x',requestId:'r'})).error.code,'DELIVERY_UNKNOWN');assert.equal(second.calls.length,0);
 });
 test('pending report never blindly retries',async()=>{
-  const journal=memory();await journal.set(journalKey('t1','t0','r'),{payload:'Result:\nx',timestamp:Date.now(),status:'pending'});
+  const journal=memory();await journal.set(journalKey('t1','session-1','t0','r'),{payloadHash:hash('Result:\nx'),timestamp:Date.now(),status:'pending'});
   const {client,calls}=fake([],{...context,parent:'t0'},journal);assert.equal((await client.report({text:'x',requestId:'r'})).error.code,'DELIVERY_PENDING');assert.equal(calls.length,0);
 });
 test('journal TTL and record cap',async()=>{
   const journal=memory();for(let i=0;i<502;i++) await journal.set(String(i),{timestamp:Date.now()-i});await journal.set('old',{timestamp:0});
   await prune(journal);assert.equal(journal.map.size,500);assert.equal(journal.map.has('old'),false);
 });
-function harness(register:any,env:Record<string,string>={}) {
-  const hooks=new Map<string,any>();const tools:any[]=[];let subprocesses=0;
+function harness(register:any,env:Record<string,string>={}, options: any = {}) {
+  const hooks=new Map<string,any>();const tools:any[]=[];let subprocesses=0;const checks:any[]=[];const processCalls:any[]=[];
   const on=(event:string,matcher:any,hook?:any)=>{const callback=hook??matcher;hooks.set(event==='tool.call'?matcher.tool:event,callback);return {catch:()=>{}}};
   register(on,{});
-  const $={env:{get:async(key:string)=>env[key]},session:{cwd:async()=>'/repo'},tool:{register:async(spec:any)=>{tools.push(spec)},check:async()=>({decision:'ask'})},store:{keys:async()=>[]},process:{run:async()=>{subprocesses++;return output({})}}};
-  return {hooks,tools,$,count:()=>subprocesses,start:()=>hooks.get('session.start')($,{},async()=>({}))};
+  const $={env:{get:async(key:string)=>env[key]},session:{cwd:async()=>'/repo',id:async()=>options.sessionId ?? 'session-1'},tool:{register:async(spec:any)=>{tools.push(spec)},check:async(input:any)=>{checks.push(input);return {decision:options.permission ?? 'ask'}}},store:options.store ?? boundedStore(),process:{run:async(args:any)=>{subprocesses++;processCalls.push(args);return options.responses?.shift() ?? output({})}}};
+  return {hooks,tools,$,checks,processCalls,count:()=>subprocesses,start:()=>hooks.get('session.start')($,{},async()=>({}))};
 }
 test('mods register only the matching role and no tools outside herdr',async()=>{
   for (const register of [ownerRegister,workerRegister]) {const h=harness(register);await h.start();assert.equal(h.tools.length,0)}
@@ -138,14 +138,14 @@ test('mods register only the matching role and no tools outside herdr',async()=>
 });
 test('permission ask and deny prevent subprocess, nested agents refused',async()=>{
   const h=harness(ownerRegister,{HC_TERMINAL_ID:'t1'});await h.start();const hook=h.hooks.get('mcp__herdr-orchestrator__worker_spawn');
-  const event={tool:'mcp__herdr-orchestrator__worker_spawn',input:{template:'runner',task:'x'}};
+  const event={tool:'mcp__herdr-orchestrator__worker_spawn',tool_use_id:'call-1',requestMeta:{},template:'runner',task:'x'};
   assert.equal((await hook(h.$,event)).result.error.code,'PERMISSION_REQUIRED');
   h.$.tool.check=async()=>({decision:'deny'});assert.equal((await hook(h.$,event)).result.error.code,'PERMISSION_DENIED');
   assert.equal((await hook(h.$,{...event,agentId:'nested'})).result.error.code,'WRONG_ROLE');assert.equal(h.count(),0);
 });
 test('worker tools reject recipient overrides before sending',async()=>{
   const h=harness(workerRegister,{HC_TERMINAL_ID:'t2',HC_PARENT:'t1'});await h.start();
-  const result=await h.hooks.get('mcp__herdr-worker__report')(h.$,{tool:'mcp__herdr-worker__report',input:{text:'x',address:'other'}});
+  const result=await h.hooks.get('mcp__herdr-worker__report')(h.$,{tool:'mcp__herdr-worker__report',tool_use_id:'call-2',text:'x',address:'other'});
   assert.equal(result.result.error.code,'INVALID_INPUT');assert.equal(h.count(),0);
 });
 test('remote ID stays qualified after resolution',async()=>{
@@ -158,4 +158,133 @@ test('failed journal commit cannot cause a second send',async()=>{
   const {client,calls}=fake([output({})],{...context,parent:'t0'},journal);
   const first=await client.report({text:'x',requestId:'r'});assert.equal(first.error.code,'DELIVERY_UNKNOWN');
   const second=await client.report({text:'x',requestId:'r'});assert.equal(second.error.code,'DELIVERY_UNKNOWN');assert.equal(calls.length,1);
+});
+function boundedStore(limit = 4 * 1024 * 1024) {
+  const values: Record<string,any> = {};
+  let peak = 0;
+  return {
+    get: async(key:string)=>values[key],
+    set: async(key:string,value:any)=>{
+      const next = {...values,[key]:value};
+      const size = Buffer.byteLength(JSON.stringify(next),'utf8');
+      if (size > limit) throw new Error('Store exceeds 4 MiB');
+      values[key]=value;peak=Math.max(peak,size);
+    },
+    delete: async(key:string)=>{delete values[key]},
+    keys: async()=>Object.keys(values),
+    bytes: ()=>Buffer.byteLength(JSON.stringify(values),'utf8'),
+    peak: ()=>peak,
+  };
+}
+function storeJournal(store:any) {
+  return {
+    get:(key:string)=>store.get('delivery:'+key),
+    set:(key:string,entry:any)=>store.set('delivery:'+key,entry),
+    delete:(key:string)=>store.delete('delivery:'+key),
+    entries:async()=>Promise.all((await store.keys()).filter((key:string)=>key.startsWith('delivery:')).map(async(key:string)=>[key.slice(9),await store.get(key)])),
+  };
+}
+test('all nine hooks accept flat runtime events and check only tool arguments',async()=>{
+  const cases = [
+    ['worker_spawn',{name:'w',command:['runner']},[output(child)],true],
+    ['worker_list',{},[output({terminals:[child]})],false],
+    ['worker_send',{address:'t2',text:'a\nb'},[output(child),output({started:true})],true],
+    ['worker_wait',{},[output({reason:'timeout'})],false],
+    ['worker_read',{address:'t2'},[output(child),output({text:'screen',complete:true,how:'screen'})],false],
+    ['worker_stop',{address:'t2'},[output(child),output({})],true],
+    ['worker_templates',{},[output({templates:[]})],false],
+  ];
+  for (const [name,input,responses,mutation] of cases) {
+    const h=harness(ownerRegister,{HC_TERMINAL_ID:'t1'},{responses,permission:'allow'});await h.start();
+    const tool=`mcp__herdr-orchestrator__${name}`;
+    const result=await h.hooks.get(tool)(h.$,{tool,tool_use_id:'call',agentId:undefined,requestMeta:{source:'test'},...input});
+    assert.equal(result.result.ok,true,`${name}: ${JSON.stringify(result)}`);
+    assert.deepEqual(h.checks,mutation ? [{tool,input}] : []);
+  }
+  for (const name of ['report','ask_owner']) {
+    const h=harness(workerRegister,{HC_TERMINAL_ID:'t2',HC_PARENT:'t1'},{permission:'allow'});await h.start();
+    const tool=`mcp__herdr-worker__${name}`;const input={text:'line one\nline two',requestId:'r1'};
+    const result=await h.hooks.get(tool)(h.$,{tool,tool_use_id:'call',requestMeta:{},...input});
+    assert.equal(result.result.ok,true);assert.deepEqual(h.checks,[{tool,input}]);
+    assert.equal(h.processCalls[0].at(-1),`${name==='report'?'Result':'Question'} [r1]:\n${input.text}`);
+  }
+});
+test('many full-size reports fit a store limited to 4 MiB',async()=>{
+  const store=boundedStore();const journal=storeJournal(store);
+  // Leave most of the plugin store to unrelated plugin state.
+  await store.set('other-state','x'.repeat(2800000));
+  const transport={run:async()=>output({})};
+  const client=createClient({transport,context:{...context,parent:'t0'},journal});
+  for(let i=0;i<160;i++) {
+    const result=await client.report({text:'я'.repeat(32768),requestId:`report-${i}`});
+    assert.equal(result.ok,true,JSON.stringify(result));
+  }
+  assert.ok(store.peak() < 4*1024*1024);
+  for(const [,entry] of await journal.entries()) { assert.equal(entry.payload,undefined);assert.equal(typeof entry.payloadHash,'string'); }
+});
+test('byte eviction happens before store.set and removes oldest entries',async()=>{
+  const store=boundedStore();const journal=storeJournal(store);const now=Date.now();
+  const makeEntry=(index:number)=>({sender:'t1',sessionId:'s',recipient:'t0',requestId:String(index),payloadHash:'hash',timestamp:now+index,implicit:false,status:'sent',result:{ok:true,data:{padding:'я'.repeat(100000)}}});
+  for(let i=0;i<7;i++) await writeEntry(journal,String(i),makeEntry(i));
+  const entries=await journal.entries();
+  assert.deepEqual(entries.map(([key])=>key),['2','3','4','5','6']);
+  assert.ok(entries.reduce((sum,[key,entry])=>sum+entryBytes(key,entry),0)<=journalBudgetBytes);
+  assert.ok(store.peak()<=journalBudgetBytes);
+});
+test('new session isolates request IDs, reload preserves sent and unknown entries',async()=>{
+  const store=boundedStore();
+  const env={HC_TERMINAL_ID:'t2',HC_PARENT:'t1'};
+  const invoke=async(sessionId:string,text:string,responses:any[]=[])=>{
+    const h=harness(workerRegister,env,{store,sessionId,permission:'allow',responses});await h.start();
+    const result=await h.hooks.get('mcp__herdr-worker__report')(h.$,{tool:'mcp__herdr-worker__report',tool_use_id:'call',text,requestId:'same'});
+    return {result:result.result,h};
+  };
+  assert.equal((await invoke('old','first')).result.ok,true);
+  const reloaded=await invoke('old','first');assert.equal(reloaded.result.data.duplicate,true);assert.equal(reloaded.h.count(),0);
+  const fresh=await invoke('new','second');assert.equal(fresh.result.ok,true);assert.equal(fresh.result.data.duplicate,false);assert.equal(fresh.h.count(),1);
+  assert.equal((await invoke('uncertain','x',[output({}, {exitCode:1})])).result.error.code,'DELIVERY_UNKNOWN');
+  const unknown=await invoke('uncertain','x');assert.equal(unknown.result.error.code,'DELIVERY_UNKNOWN');assert.equal(unknown.h.count(),0);
+});
+test('pending delivery surviving reload becomes unknown without resend',async()=>{
+  const store=boundedStore();const key=journalKey('t2','session-1','t1','r');
+  await store.set('delivery:'+key,{sender:'t2',sessionId:'session-1',recipient:'t1',requestId:'r',payloadHash:hash('Result:\nx'),timestamp:Date.now(),implicit:false,status:'pending'});
+  const h=harness(workerRegister,{HC_TERMINAL_ID:'t2',HC_PARENT:'t1'},{store,permission:'allow'});await h.start();
+  const result=await h.hooks.get('mcp__herdr-worker__report')(h.$,{tool:'mcp__herdr-worker__report',text:'x',requestId:'r'});
+  assert.equal(result.result.error.code,'DELIVERY_UNKNOWN');assert.equal(h.count(),0);
+});
+test('single command shell syntax rejected; multiple argv elements remain literal',async()=>{
+  for(const suffix of [' ','\t','\n',';','|','&','$','`','(',')','<','>',"'",'"','\\']) {
+    const {client,calls}=fake([]);assert.equal((await client.spawn({name:'w',command:[`runner${suffix}argument`]})).error.code,'INVALID_INPUT');assert.equal(calls.length,0);
+  }
+  const single=fake([output(child)]);assert.equal((await single.client.spawn({name:'w',command:['/usr/bin/runner']})).ok,true);
+  const multiple=fake([output(child)]);const command=['/a path/runner','; $() `text`\n'];
+  assert.equal((await multiple.client.spawn({name:'w',command})).ok,true);assert.deepEqual(multiple.calls[0].args.slice(-3),['--',...command]);
+});
+test('implicit unknown expires after 60 seconds; explicit unknown and pending wait for TTL',async()=>{
+  const journal=memory();const {client,calls}=fake([new Error('timeout'),output({})],{...context,parent:'t0'},journal);
+  assert.equal((await client.report({text:'x'})).error.code,'DELIVERY_UNKNOWN');
+  assert.equal((await client.report({text:'x'})).error.code,'DELIVERY_UNKNOWN');assert.equal(calls.length,1);
+  for(const entry of journal.map.values())entry.timestamp-=61000;
+  assert.equal((await client.report({text:'x'})).ok,true);assert.equal(calls.length,2);
+  for(const status of ['unknown','pending']) {
+    const store=memory();const key=journalKey('t1','session-1','t0','r');
+    await store.set(key,{sender:'t1',sessionId:'session-1',recipient:'t0',requestId:'r',payloadHash:hash('Result:\nx'),timestamp:Date.now()-61000,implicit:false,status});
+    const attempt=fake([output({})],{...context,parent:'t0'},store);
+    assert.equal((await attempt.client.report({text:'x',requestId:'r'})).error.code,status==='pending'?'DELIVERY_PENDING':'DELIVERY_UNKNOWN');assert.equal(attempt.calls.length,0);
+    store.map.get(key).timestamp-=7*86400000;
+    assert.equal((await attempt.client.report({text:'x',requestId:'r'})).ok,true);assert.equal(attempt.calls.length,1);
+  }
+});
+test('a session change without session.start also isolates report keys',async()=>{
+  const options={permission:'allow',sessionId:'before-clear'};
+  const h=harness(workerRegister,{HC_TERMINAL_ID:'t2',HC_PARENT:'t1'},options);await h.start();
+  const event={tool:'mcp__herdr-worker__report',tool_use_id:'call',text:'x',requestId:'r'};
+  const hook=h.hooks.get(event.tool);
+  assert.equal((await hook(h.$,event)).result.ok,true);
+  options.sessionId='after-clear';
+  const fresh=await hook(h.$,event);assert.equal(fresh.result.ok,true);assert.equal(fresh.result.data.duplicate,false);assert.equal(h.count(),2);
+});
+test('journal byte accounting includes UTF-8, escapes and store keys',()=>{
+  const key='key"\nя😀';const entry:any={payloadHash:'hash',timestamp:1,result:{data:{text:'я😀\ud800\n"'}}};
+  assert.equal(entryBytes(key,entry),Buffer.byteLength(JSON.stringify({['delivery:'+key]:entry}),'utf8'));
 });
