@@ -444,3 +444,16 @@ test('delivered report returns a JSON success and duplicate prevents a second se
   assert.equal(typeof first.result,'string');assert.equal(first.isError,undefined);assert.equal(JSON.parse(first.result).data.delivery,'sent');
   const second=decodeReply(await h.rawHooks.get(tool)(h.$,event));assert.equal(second.result.data.duplicate,true);assert.equal(h.count(),1);
 });
+test('spawn schema uses only supported fields and all seven owner tools register',async()=>{
+  const h=harness(ownerRegister,{HC_TERMINAL_ID:'t1'});await h.start();
+  assert.deepEqual(h.tools.map(tool=>tool.name).sort(),['worker_spawn','worker_list','worker_send','worker_wait','worker_read','worker_stop','worker_templates'].sort());
+  const spawn=h.tools.find(tool=>tool.name==='worker_spawn');
+  assert.deepEqual(Object.keys(spawn.inputSchema).sort(),['type','properties','additionalProperties'].sort());
+  const serialized=JSON.stringify(spawn.inputSchema);
+  for(const keyword of ['oneOf','anyOf','not']) assert.equal(serialized.includes(`"${keyword}"`),false);
+  for(const register of [ownerRegister,workerRegister]) {
+    const env=register===ownerRegister?{HC_TERMINAL_ID:'t1'}:{HC_TERMINAL_ID:'t2',HC_PARENT:'t1'};
+    const role=harness(register,env);await role.start();
+    for(const tool of role.tools) for(const keyword of ['oneOf','anyOf','not']) assert.equal(Object.hasOwn(tool.inputSchema,keyword),false);
+  }
+});
