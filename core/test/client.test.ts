@@ -344,3 +344,42 @@ test('single command rejects expansion, comments and nonmatching executables',as
     const {client}=fake([output(child)]);assert.equal((await client.spawn({name:'w',command:[value]})).ok,true);
   }
 });
+test('prune rechecks expired, legacy and eviction candidates before deleting',async()=>{
+  for(const scenario of ['expired','legacy','eviction']) {
+    const journal=memory();const now=Date.now();
+    const key=scenario==='legacy'?JSON.stringify(['foreign','owner','r']):journalKey('foreign','foreign-session','owner','r');
+    const snapshot=deliveryEntry('r',{timestamp:scenario==='eviction'?now-1000:now-8*86400000});
+    journal.map.set(key,snapshot);
+    if(scenario==='eviction') for(let i=0;i<500;i++) journal.map.set(journalKey('foreign','foreign-session','owner',String(i)),deliveryEntry(String(i),{status:'pending'}));
+    const fresh=deliveryEntry('r',{status:'pending',timestamp:now,payloadHash:'fresh-hash'});
+    const originalGet=journal.get;const deletes:string[]=[];
+    journal.get=async(candidate:string)=>{if(candidate===key)journal.map.set(key,fresh);return originalGet(candidate)};
+    const originalDelete=journal.delete;journal.delete=async(candidate:string)=>{deletes.push(candidate);await originalDelete(candidate)};
+    await prune(journal,now);
+    assert.deepEqual(deletes,[]);assert.equal(journal.map.get(key),fresh);assert.equal(journal.map.get(key).status,'pending');
+  }
+});
+test('each snapshot comparison field independently prevents deletion',async()=>{
+  for(const update of [{timestamp:Date.now()},{status:'pending'},{payloadHash:'new-hash'}]) {
+    const journal=memory();const key=journalKey('foreign','foreign-session','owner','r');
+    const snapshot=deliveryEntry('r',{timestamp:0});journal.map.set(key,snapshot);
+    const fresh={...snapshot,...update};let deletes=0;
+    journal.get=async()=>{journal.map.set(key,fresh);return fresh};journal.delete=async()=>{deletes++};
+    await prune(journal);assert.equal(deletes,0);assert.equal(journal.map.get(key),fresh);
+  }
+});
+test('two concurrent reservations may exceed the soft entry cap without overflowing store bytes',async()=>{
+  const store=boundedStore();const journal=storeJournal(store);
+  for(let i=0;i<499;i++) await journal.set(journalKey('foreign','foreign-session','owner',String(i)),deliveryEntry(String(i),{status:'pending'}));
+  const originalEntries=journal.entries;let readers=0;let release:any;
+  const bothRead=new Promise<void>(resolve=>{release=resolve});
+  journal.entries=async()=>{const snapshot=await originalEntries();if(++readers===2)release();await bothRead;return snapshot};
+  const first=journalKey('first','s1','owner','r');const second=journalKey('second','s2','owner','r');
+  await Promise.all([
+    writeEntry(journal,first,deliveryEntry('r',{sender:'first',sessionId:'s1',status:'pending'})),
+    writeEntry(journal,second,deliveryEntry('r',{sender:'second',sessionId:'s2',status:'pending'})),
+  ]);
+  const entries=await originalEntries();assert.equal(entries.length,501);
+  assert.equal((await journal.get(first)).status,'pending');assert.equal((await journal.get(second)).status,'pending');
+  assert.ok(store.bytes()<journalBudgetBytes);assert.ok(store.peak()<4*1024*1024);
+});

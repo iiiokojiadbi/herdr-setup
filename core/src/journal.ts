@@ -20,21 +20,38 @@ export function entryBytes(key: string, entry: Entry): number {
   }
   return bytes;
 }
+// The shared store has no atomic compare-and-swap. Rechecking before deletion is
+// best-effort: a write can still race the following delete or reserve the last
+// slot concurrently. The 500-entry cap is soft (499 pending + two writes can
+// become 501); the byte budget leaves headroom under the 4 MiB store limit.
+// Strict guarantees would require an external lock, outside this MVP.
+async function removeUnchanged(journal: Journal, key: string, snapshot: Entry): Promise<boolean> {
+  const current = await journal.get(key);
+  if (!current) return true;
+  if (current.timestamp !== snapshot.timestamp || current.status !== snapshot.status || current.payloadHash !== snapshot.payloadHash) return false;
+  await journal.delete(key);
+  return true;
+}
 export async function prune(journal: Journal, now = Date.now(), incoming?: [string,Entry]): Promise<void> {
   const reservedBytes = incoming ? entryBytes(...incoming) : 0;
   if (reservedBytes > journalBudgetBytes) throw new Fault('JOURNAL_FULL','Delivery entry exceeds journal byte budget.');
   const entries = (await journal.entries()).filter(([key]) => key !== incoming?.[0]).sort((a,b) => a[1].timestamp - b[1].timestamp);
   const retained: [string,Entry][] = [];
   let bytes = reservedBytes;
+  const changed = new Set<string>();
   for (const [key,entry] of entries) {
-    if (!currentKey(key) || now - entry.timestamp >= ttlMs) await journal.delete(key);
-    else { retained.push([key,entry]); bytes += entryBytes(key,entry); }
+    if (!currentKey(key) || now - entry.timestamp >= ttlMs) {
+      if (await removeUnchanged(journal,key,entry)) continue;
+      changed.add(key);
+    }
+    retained.push([key,entry]); bytes += entryBytes(key,entry);
   }
   let count = retained.length + (incoming ? 1 : 0);
   for (const [key,entry] of retained) {
     if (count <= 500 && bytes <= journalBudgetBytes) break;
+    if (changed.has(key)) continue;
     if (entry.status === 'pending' && now - entry.timestamp < pendingProtectionMs) continue;
-    await journal.delete(key);
+    if (!await removeUnchanged(journal,key,entry)) continue;
     bytes -= entryBytes(key,entry);
     count--;
   }
