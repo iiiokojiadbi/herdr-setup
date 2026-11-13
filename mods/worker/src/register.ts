@@ -29,9 +29,9 @@ export const register: Register = (on) => {
     context = {self,parent,cwd:await $.session.cwd(),sessionId:await $.session.id()};
     if (!self || !parent) return next(e);
     const journal = journalAdapter($);
-    // A pending entry surviving reload has an unknown delivery outcome.
-    for (const [key,entry] of await journal.entries()) if (entry.status === 'pending') await writeEntry(journal,key,{...entry,status:'unknown'});
     await prune(journal);
+    // Only this session's abandoned deliveries can be recovered on reload.
+    for (const [key,entry] of await journal.entries()) if (entry.status === 'pending' && entry.sender === self && entry.sessionId === context.sessionId) await writeEntry(journal,key,{...entry,status:'unknown'});
     await $.tool.register({"name": "report", "description": "Send result or blocker to parent. Reuse requestId on retry; new IDs can duplicate delivery. Without ID, deduplicate for 60 seconds including unknown outcomes, then allow another delivery. Explicit IDs keep unknown or pending outcomes until TTL (7 days), subject to journal eviction.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"text": {"type": "string", "minLength": 1, "maxLength": 32768}, "blocker": {"type": "boolean"}, "requestId": {"type": "string", "minLength": 1, "maxLength": 128}}, "required": ["text"]}, "isDeferred": false});
     await $.tool.register({"name": "ask_owner", "description": "Send question to parent without waiting for response. Reuse requestId on retry; new IDs can duplicate delivery. Without ID, unknown outcomes can be retried after 60 seconds. Explicit IDs keep unknown or pending outcomes until TTL (7 days), subject to journal eviction.", "inputSchema": {"type": "object", "additionalProperties": false, "properties": {"text": {"type": "string", "minLength": 1, "maxLength": 32768}, "requestId": {"type": "string", "minLength": 1, "maxLength": 128}}, "required": ["text"]}, "isDeferred": false});
     return next(e);

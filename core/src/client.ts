@@ -37,7 +37,7 @@ export function createClient({ transport, context, journal }: {transport: Transp
       if (role === 'worker' && !context.parent) throw new Fault('NO_PARENT','No parent address.');
       return await action();
     } catch (error) {
-      return error instanceof Fault ? failure(error.code,error.message,error.effect,error.data,error.details) : failure('HC_ERROR',String(error),'unknown');
+      return error instanceof Fault ? failure(error.code,error.message,error.effect,error.data,error.details,error.code === 'JOURNAL_FULL' ? 'Wait for active deliveries to finish, then retry with the same requestId.' : undefined) : failure('HC_ERROR',String(error),'unknown');
     }
   }
   async function deliver(input: Data, kind: string): Promise<Envelope> {
@@ -81,7 +81,7 @@ export function createClient({ transport, context, journal }: {transport: Transp
       else if (!Array.isArray(input.command) || !input.command.length || input.task !== undefined) throw new Fault('INVALID_INPUT','Provide template and task or command argv.');
       if (!byTemplate) {
         for (const arg of input.command) text(arg,'command argument');
-        if (input.command.length === 1 && /[\s;|&$`()<>'"\\]/u.test(input.command[0])) throw new Fault('INVALID_INPUT','A single command element must be a plain executable without whitespace or shell characters.');
+        if (input.command.length === 1 && /^[A-Za-z0-9._/-]+$/.exec(input.command[0])?.[0] !== input.command[0]) throw new Fault('INVALID_INPUT','A single command element must match ^[A-Za-z0-9._/-]+$.');
       }
       if (input.cwd !== undefined && input.worktree !== undefined) throw new Fault('INVALID_INPUT','cwd and worktree are exclusive.');
       const cwd = input.worktree ?? input.cwd ?? context.cwd;

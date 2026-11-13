@@ -120,7 +120,7 @@ test('pending report never blindly retries',async()=>{
   const {client,calls}=fake([],{...context,parent:'t0'},journal);assert.equal((await client.report({text:'x',requestId:'r'})).error.code,'DELIVERY_PENDING');assert.equal(calls.length,0);
 });
 test('journal TTL and record cap',async()=>{
-  const journal=memory();for(let i=0;i<502;i++) await journal.set(String(i),{timestamp:Date.now()-i});await journal.set('old',{timestamp:0});
+  const journal=memory();for(let i=0;i<502;i++) await journal.set(journalKey('t1','s','t0',String(i)),{timestamp:Date.now()-i});await journal.set('old',{timestamp:0});
   await prune(journal);assert.equal(journal.map.size,500);assert.equal(journal.map.has('old'),false);
 });
 function harness(register:any,env:Record<string,string>={}, options: any = {}) {
@@ -225,9 +225,9 @@ test('many full-size reports fit a store limited to 4 MiB',async()=>{
 test('byte eviction happens before store.set and removes oldest entries',async()=>{
   const store=boundedStore();const journal=storeJournal(store);const now=Date.now();
   const makeEntry=(index:number)=>({sender:'t1',sessionId:'s',recipient:'t0',requestId:String(index),payloadHash:'hash',timestamp:now+index,implicit:false,status:'sent',result:{ok:true,data:{padding:'я'.repeat(100000)}}});
-  for(let i=0;i<7;i++) await writeEntry(journal,String(i),makeEntry(i));
+  for(let i=0;i<7;i++) await writeEntry(journal,journalKey('t1','s','t0',String(i)),makeEntry(i));
   const entries=await journal.entries();
-  assert.deepEqual(entries.map(([key])=>key),['2','3','4','5','6']);
+  assert.deepEqual(entries.map(([key])=>JSON.parse(key)[3]),['2','3','4','5','6']);
   assert.ok(entries.reduce((sum,[key,entry])=>sum+entryBytes(key,entry),0)<=journalBudgetBytes);
   assert.ok(store.peak()<=journalBudgetBytes);
 });
@@ -253,7 +253,7 @@ test('pending delivery surviving reload becomes unknown without resend',async()=
   assert.equal(result.result.error.code,'DELIVERY_UNKNOWN');assert.equal(h.count(),0);
 });
 test('single command shell syntax rejected; multiple argv elements remain literal',async()=>{
-  for(const suffix of [' ','\t','\n',';','|','&','$','`','(',')','<','>',"'",'"','\\']) {
+  for(const suffix of ['*','?','~','#','+',' ','\t','\n',';','|','&','$','`','(',')','<','>',"'",'"','\\']) {
     const {client,calls}=fake([]);assert.equal((await client.spawn({name:'w',command:[`runner${suffix}argument`]})).error.code,'INVALID_INPUT');assert.equal(calls.length,0);
   }
   const single=fake([output(child)]);assert.equal((await single.client.spawn({name:'w',command:['/usr/bin/runner']})).ok,true);
@@ -287,4 +287,60 @@ test('a session change without session.start also isolates report keys',async()=
 test('journal byte accounting includes UTF-8, escapes and store keys',()=>{
   const key='key"\nя😀';const entry:any={payloadHash:'hash',timestamp:1,result:{data:{text:'я😀\ud800\n"'}}};
   assert.equal(entryBytes(key,entry),Buffer.byteLength(JSON.stringify({['delivery:'+key]:entry}),'utf8'));
+});
+function deliveryEntry(requestId:string, overrides:any={}) {
+  return {sender:'foreign',sessionId:'foreign-session',recipient:'owner',requestId,payloadHash:'hash',timestamp:Date.now(),implicit:false,status:'sent',...overrides};
+}
+test('another worker cannot evict the oldest active pending among 499 sent entries',async()=>{
+  const journal=memory();const now=Date.now();
+  for(let i=0;i<499;i++) journal.map.set(journalKey('foreign','foreign-session','owner',String(i)),deliveryEntry(String(i),{timestamp:now-5000+i}));
+  let started:any,finish:any;
+  const entered=new Promise<void>(resolve=>{started=resolve});
+  const first=createClient({context:{...context,parent:'owner'},journal,transport:{run:async()=>{started();return new Promise(resolve=>{finish=resolve})}}});
+  const ongoing=first.report({text:'first',requestId:'active'});await entered;
+  const activeKey=journalKey('t1','session-1','owner','active');
+  journal.map.get(activeKey).timestamp=now-6000;
+  const second=fake([output({})],{...context,self:'other-worker',parent:'owner'},journal);
+  assert.equal((await second.client.report({text:'second',requestId:'new'})).ok,true);
+  assert.equal(journal.map.get(activeKey).status,'pending');assert.equal(journal.map.size,500);
+  assert.equal(journal.map.has(journalKey('foreign','foreign-session','owner','0')),false);
+  finish(output({}));assert.equal((await ongoing).ok,true);
+});
+test('a journal full of protected pending refuses a new delivery before send',async()=>{
+  for(const limit of ['count','bytes']) {
+    const journal=memory();const count=limit==='count'?500:2;
+    for(let i=0;i<count;i++) journal.map.set(journalKey('foreign','foreign-session','owner',String(i)),deliveryEntry(String(i),{status:'pending',...(limit==='bytes'?{result:{ok:true,data:{padding:'x'.repeat(530000)}}}:{})}));
+    const {client,calls}=fake([],{...context,parent:'owner'},journal);
+    const result=await client.report({text:'new',requestId:'new'});
+    assert.equal(result.ok,false);assert.equal(result.error.code,'JOURNAL_FULL');assert.equal(result.error.effect,'none');assert.match(result.error.hint,/active deliveries/);
+    assert.equal(calls.length,0);assert.equal(journal.map.size,count);
+    assert.ok([...journal.map.values()].every(entry=>entry.status==='pending'));
+  }
+});
+test('pending older than ten minutes can be evicted',async()=>{
+  const journal=memory();const now=Date.now();
+  for(let i=0;i<500;i++) journal.map.set(journalKey('foreign','foreign-session','owner',String(i)),deliveryEntry(String(i),{status:'pending',timestamp:now-600001+i}));
+  const {client}=fake([output({})],{...context,parent:'owner'},journal);
+  assert.equal((await client.report({text:'new',requestId:'new'})).ok,true);
+  assert.equal(journal.map.has(journalKey('foreign','foreign-session','owner','0')),false);
+});
+test('startup leaves foreign pending protected and cleans old keys in every status',async()=>{
+  const store=boundedStore();const activeKey=journalKey('foreign','other-session','owner','active');
+  await store.set('delivery:'+activeKey,deliveryEntry('active',{status:'pending'}));
+  for(const status of ['sent','pending','unknown']) await store.set('delivery:'+JSON.stringify(['old-worker','owner',status]),{sender:'old-worker',recipient:'owner',requestId:status,payload:'old full text',timestamp:Date.now(),status});
+  const h=harness(workerRegister,{HC_TERMINAL_ID:'t2',HC_PARENT:'t1'},{store,permission:'allow'});await h.start();
+  assert.deepEqual(await store.keys(),['delivery:'+activeKey]);assert.equal((await store.get('delivery:'+activeKey)).status,'pending');assert.equal(h.count(),0);assert.equal(h.tools.length,2);
+});
+test('prune removes legacy sent, pending and unknown keys without a session',async()=>{
+  const journal=memory();
+  for(const status of ['sent','pending','unknown']) journal.map.set(JSON.stringify(['old-worker','owner',status]),{payload:'legacy',timestamp:Date.now(),status});
+  await prune(journal);assert.equal(journal.map.size,0);
+});
+test('single command rejects expansion, comments and nonmatching executables',async()=>{
+  for(const value of ['runner*','runner?','~','#comment','runner+suffix','команда','runner\n','runner\r','runner\r\n']) {
+    const {client,calls}=fake([]);assert.equal((await client.spawn({name:'w',command:[value]})).error.code,'INVALID_INPUT');assert.equal(calls.length,0);
+  }
+  for(const value of ['runner','./runner','/usr/bin/runner','runner_1.2-3']) {
+    const {client}=fake([output(child)]);assert.equal((await client.spawn({name:'w',command:[value]})).ok,true);
+  }
 });
