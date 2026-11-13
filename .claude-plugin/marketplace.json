@@ -1,0 +1,1 @@
+{"name":"herdr-setup","owner":{"name":"herdr-setup maintainers"},"plugins":[{"name":"herdr-orchestrator","source":"./dist/herdr-orchestrator","description":"Herdr orchestration tools."},{"name":"herdr-worker","source":"./dist/herdr-worker","description":"Herdr parent reporting tools."}]}

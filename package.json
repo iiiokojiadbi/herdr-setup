@@ -1,0 +1,1 @@
+{"name":"herdr-worker-tools","version":"0.1.0","private":true,"type":"module","scripts":{"build":"node scripts/build.mjs","typecheck":"node scripts/typecheck.mjs","test":"node scripts/test.mjs","install:instructions":"node scripts/install.mjs"},"devDependencies":{"esbuild":"^0.27.0","typescript":"^5.9.0"}}
