@@ -123,12 +123,26 @@ test('journal TTL and record cap',async()=>{
   const journal=memory();for(let i=0;i<502;i++) await journal.set(journalKey('t1','s','t0',String(i)),{timestamp:Date.now()-i});await journal.set('old',{timestamp:0});
   await prune(journal);assert.equal(journal.map.size,500);assert.equal(journal.map.has('old'),false);
 });
+function decodeReply(reply:any) {
+  assert.equal(typeof reply.result,'string','Tool result must be a JSON string.');
+  const envelope=JSON.parse(reply.result);
+  assert.equal(typeof envelope.ok,'boolean');
+  assert.ok(envelope.data && typeof envelope.data==='object');
+  if (envelope.ok) assert.equal(reply.isError,undefined);
+  else assert.equal(reply.isError,true,'Failed envelopes must be marked as tool errors.');
+  return {...reply,result:envelope};
+}
 function harness(register:any,env:Record<string,string>={}, options: any = {}) {
-  const hooks=new Map<string,any>();const tools:any[]=[];let subprocesses=0;const checks:any[]=[];const processCalls:any[]=[];
-  const on=(event:string,matcher:any,hook?:any)=>{const callback=hook??matcher;hooks.set(event==='tool.call'?matcher.tool:event,callback);return {catch:()=>{}}};
+  const hooks=new Map<string,any>();const rawHooks=new Map<string,any>();const catches=new Map<string,any>();const tools:any[]=[];let subprocesses=0;const checks:any[]=[];const processCalls:any[]=[];
+  const on=(event:string,matcher:any,hook?:any)=>{
+    const callback=hook??matcher;const key=event==='tool.call'?matcher.tool:event;
+    rawHooks.set(key,callback);
+    hooks.set(key,event==='tool.call'?async(...args:any[])=>decodeReply(await callback(...args)):callback);
+    return {catch:(handler:any)=>{catches.set(key,handler)}};
+  };
   register(on,{});
   const $={env:{get:async(key:string)=>env[key]},session:{cwd:async()=>'/repo',id:async()=>options.sessionId ?? 'session-1'},tool:{register:async(spec:any)=>{tools.push(spec)},check:async(input:any)=>{checks.push(input);return {decision:options.permission ?? 'ask'}}},store:options.store ?? boundedStore(),process:{run:async(args:any)=>{subprocesses++;processCalls.push(args);return options.responses?.shift() ?? output({})}}};
-  return {hooks,tools,$,checks,processCalls,count:()=>subprocesses,start:()=>hooks.get('session.start')($,{},async()=>({}))};
+  return {hooks,rawHooks,catches,tools,$,checks,processCalls,count:()=>subprocesses,start:()=>hooks.get('session.start')($,{},async()=>({}))};
 }
 test('mods register only the matching role and no tools outside herdr',async()=>{
   for (const register of [ownerRegister,workerRegister]) {const h=harness(register);await h.start();assert.equal(h.tools.length,0)}
@@ -382,4 +396,51 @@ test('two concurrent reservations may exceed the soft entry cap without overflow
   const entries=await originalEntries();assert.equal(entries.length,501);
   assert.equal((await journal.get(first)).status,'pending');assert.equal((await journal.get(second)).status,'pending');
   assert.ok(store.bytes()<journalBudgetBytes);assert.ok(store.peak()<4*1024*1024);
+});
+test('every hook serializes guards and catch failures with isError',async()=>{
+  for (const [register,env,wrongEnv] of [
+    [ownerRegister,{HC_TERMINAL_ID:'t1'},{HC_TERMINAL_ID:'t1',HC_PARENT:'t0'}],
+    [workerRegister,{HC_TERMINAL_ID:'t2',HC_PARENT:'t1'},{HC_TERMINAL_ID:'t2'}],
+  ] as const) {
+    const outside=harness(register);await outside.start();
+    const names=[...outside.rawHooks.keys()].filter(key=>key.startsWith('mcp__'));
+    for(const tool of names) {
+      const result=decodeReply(await outside.rawHooks.get(tool)(outside.$,{tool,tool_use_id:'call'}));
+      assert.equal(result.result.error.code,'NOT_IN_HERDR');assert.equal(result.isError,true);
+    }
+    const wrong=harness(register,wrongEnv);await wrong.start();
+    for(const tool of names) assert.equal(decodeReply(await wrong.rawHooks.get(tool)(wrong.$,{tool,tool_use_id:'call'})).result.error.code,'WRONG_ROLE');
+    const active=harness(register,env,{permission:'allow'});await active.start();
+    for(const tool of names) {
+      const unknown=decodeReply(await active.rawHooks.get(tool)(active.$,{tool,tool_use_id:'call',unexpected:'value'}));
+      assert.equal(unknown.result.error.code,'INVALID_INPUT');assert.equal(unknown.isError,true);
+      const nested=decodeReply(await active.rawHooks.get(tool)(active.$,{tool,tool_use_id:'call',agentId:'nested'}));
+      assert.equal(nested.result.error.code,'WRONG_ROLE');
+      const caught=decodeReply(active.catches.get(tool)());assert.equal(caught.result.error.code,'HC_ERROR');assert.equal(caught.isError,true);
+    }
+    assert.equal(active.count(),0);
+  }
+});
+test('permission refusals serialize as JSON errors for all changing tools',async()=>{
+  for(const [register,env,names] of [
+    [ownerRegister,{HC_TERMINAL_ID:'t1'},['worker_spawn','worker_send','worker_stop']],
+    [workerRegister,{HC_TERMINAL_ID:'t2',HC_PARENT:'t1'},['report','ask_owner']],
+  ] as const) {
+    for(const permission of ['ask','deny']) {
+      const h=harness(register,env,{permission});await h.start();
+      for(const name of names) {
+        const tool=[...h.rawHooks.keys()].find(key=>key.endsWith(`__${name}`))!;
+        const result=decodeReply(await h.rawHooks.get(tool)(h.$,{tool,tool_use_id:'call'}));
+        assert.equal(result.result.error.code,permission==='ask'?'PERMISSION_REQUIRED':'PERMISSION_DENIED');assert.equal(result.isError,true);
+      }
+      assert.equal(h.count(),0);
+    }
+  }
+});
+test('delivered report returns a JSON success and duplicate prevents a second send',async()=>{
+  const h=harness(workerRegister,{HC_TERMINAL_ID:'t2',HC_PARENT:'t1'},{permission:'allow'});await h.start();
+  const tool='mcp__herdr-worker__report';const event={tool,tool_use_id:'call',text:'delivered',requestId:'r'};
+  const first=await h.rawHooks.get(tool)(h.$,event);
+  assert.equal(typeof first.result,'string');assert.equal(first.isError,undefined);assert.equal(JSON.parse(first.result).data.delivery,'sent');
+  const second=decodeReply(await h.rawHooks.get(tool)(h.$,event));assert.equal(second.result.data.duplicate,true);assert.equal(h.count(),1);
 });
