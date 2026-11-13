@@ -15,7 +15,17 @@ claude plugin validate dist/herdr-worker
 
 `MOD_API_TYPES` указывает на декларации установленного движка из встроенного навыка `plugin-authoring` (`types/claude-code.d.ts`). Первый запуск копирует их в кеш `node_modules`; последующие `npm run typecheck` используют кеш. Декларации в репозиторий не входят. Сборка встраивает ядро в каждый плагин, внешних runtime-импортов нет.
 
-Установка — вручную после сборки. `node scripts/install.mjs` печатает команды для текущего checkout и ничего не устанавливает:
+Установка из общего marketplace:
+
+```bash
+claude plugin marketplace add iiiokojiadbi/claude-plugins
+claude plugin install herdr-orchestrator@iiiokojiadbi --scope user
+claude plugin install herdr-worker@iiiokojiadbi --scope user
+```
+
+Собранные `dist` закоммичены в репозиторий, marketplace берет их по тегу `herdr--v0.1.0`.
+
+Локальная сборка для разработки: `node scripts/install.mjs` печатает команды для текущего checkout и ничего не устанавливает:
 
 ```bash
 claude plugin marketplace add /absolute/path/to/checkout
@@ -31,7 +41,7 @@ claude plugin enable herdr-worker@herdr-setup --scope user
 {"permissions":{"allow":["mcp__herdr-orchestrator__*","mcp__herdr-worker__*"]}}
 ```
 
-Затем `/reload-plugins`. Marketplace использует относительные пути к `dist`; сохраняйте checkout с собранными артефактами. Для разработки передайте обе папки через повторенный `--plugin-dir`.
+Затем `/reload-plugins`. Локальный marketplace использует относительные пути к `dist`; сохраняйте checkout с собранными артефактами. Для разработки передайте обе папки через повторенный `--plugin-dir`.
 
 Без `HC_TERMINAL_ID` инструменты не регистрируются. При пустом `HC_PARENT` доступны семь инструментов ведущего: `worker_spawn`, `worker_list`, `worker_send`, `worker_wait`, `worker_read`, `worker_stop`, `worker_templates`. При заданном `HC_PARENT` доступны только `report` и `ask_owner`. Вложенные агенты получают отказ. Перед изменяющей операцией проверяются разрешения движка.
 
