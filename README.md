@@ -23,7 +23,7 @@ claude plugin install herdr-orchestrator@iiiokojiadbi --scope user
 claude plugin install herdr-worker@iiiokojiadbi --scope user
 ```
 
-Собранные `dist` закоммичены в репозиторий, marketplace берет их по тегу `herdr--v0.1.0`.
+Собранные `dist` закоммичены в репозиторий, marketplace берет их по тегу `herdr--v0.2.0`.
 
 Локальная сборка для разработки: `node scripts/install.mjs` печатает команды для текущего checkout и ничего не устанавливает:
 
