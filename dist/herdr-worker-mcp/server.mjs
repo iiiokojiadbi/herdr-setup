@@ -61,7 +61,9 @@ async function removeUnchanged(journal, key, snapshot) {
 async function prune(journal, now = Date.now(), incoming) {
   const reservedBytes = incoming ? entryBytes(...incoming) : 0;
   if (reservedBytes > journalBudgetBytes) throw new Fault("JOURNAL_FULL", "Delivery entry exceeds journal byte budget.");
-  const entries = (await journal.entries()).filter(([key]) => key !== incoming?.[0]).sort((a, b) => a[1].timestamp - b[1].timestamp);
+  const canonicalKey = (key) => journal.canonicalKey?.(key) ?? key;
+  const incomingKey = incoming ? canonicalKey(incoming[0]) : void 0;
+  const entries = (await journal.entries()).filter(([key]) => canonicalKey(key) !== incomingKey).sort((a, b) => a[1].timestamp - b[1].timestamp);
   const retained = [];
   let bytes = reservedBytes;
   const changed = /* @__PURE__ */ new Set();
@@ -132,6 +134,9 @@ var FileJournal = class {
   storageKey(key) {
     const parts = JSON.parse(key);
     return parts[0] === "" && parts[1] === "" && parts[2] === "" ? parts[3] : this.key(key);
+  }
+  canonicalKey(key) {
+    return JSON.stringify(["", "", "", this.storageKey(key)]);
   }
   async set(key, entry) {
     const next = new Map(this.values);

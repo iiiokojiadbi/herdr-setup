@@ -1,6 +1,6 @@
 import { Fault, type Envelope } from './errors';
 export interface Entry { sender: string; sessionId: string; recipient: string; requestId: string; payloadHash: string; timestamp: number; implicit: boolean; status: 'pending' | 'sent' | 'unknown'; result?: Envelope }
-export interface Journal { get(key: string): Promise<Entry | undefined>; set(key: string, entry: Entry): Promise<void>; entries(): Promise<[string,Entry][]>; delete(key: string): Promise<void> }
+export interface Journal { canonicalKey?(key: string): string; get(key: string): Promise<Entry | undefined>; set(key: string, entry: Entry): Promise<void>; entries(): Promise<[string,Entry][]>; delete(key: string): Promise<void> }
 export const ttlMs = 7 * 24 * 60 * 60 * 1000;
 export const pendingProtectionMs = 10 * 60 * 1000;
 export const journalBudgetBytes = 1024 * 1024;
@@ -35,7 +35,9 @@ async function removeUnchanged(journal: Journal, key: string, snapshot: Entry): 
 export async function prune(journal: Journal, now = Date.now(), incoming?: [string,Entry]): Promise<void> {
   const reservedBytes = incoming ? entryBytes(...incoming) : 0;
   if (reservedBytes > journalBudgetBytes) throw new Fault('JOURNAL_FULL','Delivery entry exceeds journal byte budget.');
-  const entries = (await journal.entries()).filter(([key]) => key !== incoming?.[0]).sort((a,b) => a[1].timestamp - b[1].timestamp);
+  const canonicalKey = (key: string) => journal.canonicalKey?.(key) ?? key;
+  const incomingKey = incoming ? canonicalKey(incoming[0]) : undefined;
+  const entries = (await journal.entries()).filter(([key]) => canonicalKey(key) !== incomingKey).sort((a,b) => a[1].timestamp - b[1].timestamp);
   const retained: [string,Entry][] = [];
   let bytes = reservedBytes;
   const changed = new Set<string>();

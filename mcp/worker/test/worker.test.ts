@@ -9,6 +9,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../src/server';
 import { FileJournal } from '../src/journal';
+import { createClient } from '../../../core/src/client';
 import { journalKey, hash, writeEntry } from '../../../core/src/journal';
 import { configure } from '../../../scripts/install-worker-mcp.mjs';
 import { parse } from 'smol-toml';
@@ -61,10 +62,10 @@ test('missing environment returns core errors before transport',async t => {
   }
 });
 test('config merge is idempotent, keeps foreign values, rejects transport conflicts',() => {
-  const source = 'approval_policy = "on-request"\n[other]\nx = 42\n[mcp_servers.herdr-worker]\nstartup_timeout_sec = 20\n';
+  const source = 'approval_policy = "on-request"\n[other]\nx = 42\n[mcp_servers.other]\nstartup_timeout_sec = 20\n';
   const configured = configure(source,'/a b/launcher.mjs'); assert.equal(configure(configured,'/a b/launcher.mjs'),configured);
   const value: any = parse(configured); assert.equal(value.other.x,42); assert.equal(value.approval_policy,'on-request');
-  assert.equal(value.mcp_servers['herdr-worker'].startup_timeout_sec,20); assert.equal(value.mcp_servers['herdr-worker'].tools.report.approval_mode,'approve');
+  assert.equal(value.mcp_servers.other.startup_timeout_sec,20); assert.equal(value.mcp_servers['herdr-worker'].tools.report.approval_mode,'approve');
   assert.throws(() => configure('[mcp_servers.herdr-worker]\nurl = "http://example.org"\n'));
 });
 test('stdio launcher: clean stdout, protocol errors, actual hc failure, EOF and lock',{timeout:10000},async t => {
@@ -93,8 +94,7 @@ test('file journal refuses protected capacity and corrupt state before delivery'
   // Loading abandoned entries converts them to unknown; live pending entries
   // are populated after startup to exercise the shared reservation path.
   const {client,journal,calls} = await setup(t,{dir});
-  const values = new Map(Array.from({length:500},(_,index) => [String(index),entry]));
-  (journal as any).values = values;
+  for (let index=0;index<500;index++) await writeEntry(journal,journalKey('t1','terminal-lifetime','t0',`pending-${index}`),{...entry,sender:'t1',sessionId:'terminal-lifetime',recipient:'t0',requestId:`pending-${index}`,status:'pending'});
   const result = decode(await client.callTool({name:'report',arguments:{text:'x',requestId:'new'}}));
   assert.equal(result.error.code,'JOURNAL_FULL'); assert.equal(result.error.effect,'none'); assert.equal(calls.length,0);
   const path = join(dir,'corrupt.json'); await writeFile(path,'broken');
@@ -108,4 +108,55 @@ test('installer CLI dry-run, check, write and repeated write preserve foreign co
   assert.equal(run('--write').status,0); const updated = await readFile(path,'utf8');
   assert.equal(run('--check').status,0); assert.equal(run('--write').status,0); assert.equal(await readFile(path,'utf8'),updated);
   assert.equal((parse(updated) as any).foreign.x,42);
+});
+
+test('FileJournal capacity counts pending to sent as one entry and preserves oldest retry',async () => {
+  const dir = await mkdtemp(join(tmpdir(),'worker-boundary-'));
+  const journal = new FileJournal(join(dir,'journal.json')); await journal.load();
+  let calls = 0;
+  const client = createClient({context,journal,transport:{run:async () => {
+    calls++;
+    if (calls === 500 || calls === 501) {
+      const entries = await journal.entries();
+      assert.equal(entries.length,500);
+      assert.equal(entries.filter(([,entry]) => entry.status === 'pending').length,1);
+    }
+    return {exitCode:0,stdout:'{}',stderr:'',isStdoutTruncated:false,isStderrTruncated:false};
+  }}});
+  for (let index=0;index<500;index++) assert.equal((await client.report({text:'x',requestId:`id${index}`})).ok,true);
+  assert.equal((await journal.entries()).length,500);
+  assert.ok((await journal.entries()).every(([,entry]) => entry.status === 'sent'));
+  // id0 was incorrectly evicted by the old pending-to-sent update at capacity.
+  assert.equal((await client.report({text:'x',requestId:'id0'})).data.duplicate,true);
+  assert.equal(calls,500);
+  assert.equal((await client.report({text:'x',requestId:'id500'})).ok,true);
+  assert.equal((await journal.entries()).length,500);
+  // Exactly one oldest record may be evicted for the genuinely new ID.
+  assert.equal(await journal.get(journalKey('t1','terminal-lifetime','t0','id0')),undefined);
+  assert.equal((await client.report({text:'x',requestId:'id1'})).data.duplicate,true);
+  assert.equal((await client.report({text:'x',requestId:'id500'})).data.duplicate,true);
+  assert.equal(calls,501);
+  const restarted = new FileJournal(join(dir,'journal.json')); await restarted.load();
+  assert.equal((await restarted.entries()).length,500);
+  assert.equal((await restarted.get(journalKey('t1','terminal-lifetime','t0','id1')))?.status,'sent');
+});
+test('installer rejects even empty address overrides',() => {
+  for (const name of ['HC_PARENT','HC_TERMINAL_ID']) {
+    assert.throws(() => configure(`[mcp_servers.herdr-worker.env]\n${name} = ""\n`),/Conflicting/);
+    assert.throws(() => configure(`[mcp_servers.herdr-worker]\nenv = { ${name} = "" }\n`),/Conflicting/);
+  }
+});
+test('managed installer preserves unrelated TOML bytes including float and int64',() => {
+  const source = '# keep this comment\r\nfloat = 1.0 # significant spelling\r\nlarge = 9223372036854775807\r\n[foreign]\r\ntext = """multiline\r\n[not.a.table]\r\n"""\r\n';
+  const configured = configure(source,'/launcher');
+  assert.ok(configured.startsWith(source));
+  assert.equal(configure(configured,'/launcher'),configured);
+  const updated = configure(configured,'/new-launcher');
+  assert.ok(updated.startsWith(source));
+  assert.equal(parse(updated,{integersAsBigInt:'asNeeded'}).large,9223372036854775807n);
+  assert.throws(() => configure('[mcp_servers.herdr-worker]\nstartup_timeout_sec = 20\n'),/unmanaged/);
+  assert.throws(() => configure(configured+'[another]\nx=1\n'),/last/);
+  assert.throws(() => configure(configured.replace('enabled = true','enabled = true\nforeign = 1.0')),/Unowned/);
+  const unmanaged = configured.replace('# BEGIN managed herdr-worker MCP\n','').replace('# END managed herdr-worker MCP\n','');
+  assert.equal(configure(unmanaged,'/launcher'),unmanaged);
 });

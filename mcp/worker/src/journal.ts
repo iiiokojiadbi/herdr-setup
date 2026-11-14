@@ -34,6 +34,7 @@ export class FileJournal implements Journal {
     const parts = JSON.parse(key);
     return parts[0] === '' && parts[1] === '' && parts[2] === '' ? parts[3] : this.key(key);
   }
+  canonicalKey(key: string) { return JSON.stringify(['','','',this.storageKey(key)]); }
   async set(key: string, entry: Entry) {
     const next = new Map(this.values);
     // No payload, requestId, process environment, stderr or response persisted.
