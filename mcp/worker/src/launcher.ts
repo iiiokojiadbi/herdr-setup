@@ -1,13 +1,13 @@
 import { mkdir, chmod } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, URL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { stateDirectory } from './state';
 
 try {
   process.umask(0o077);
-  const directory = join(process.env.XDG_STATE_HOME || join(homedir(),'.local/state'),'herdr-worker');
+  const directory = stateDirectory();
   await mkdir(directory,{recursive:true,mode:0o700});
   await chmod(directory,0o700);
   const identity = createHash('sha256').update(JSON.stringify([process.env.HC_TERMINAL_ID,process.env.HC_PARENT])).digest('hex');

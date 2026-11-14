@@ -1,14 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile, mkdir, chmod, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, mkdir, chmod, stat, readdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createServer } from '../src/server';
 import { FileJournal } from '../src/journal';
+import { stateDirectory } from '../src/state';
 import { createClient } from '../../../core/src/client';
 import { journalKey, hash, writeEntry } from '../../../core/src/journal';
 import { configure } from '../../../scripts/install-worker-mcp.mjs';
@@ -70,6 +71,10 @@ test('config merge is idempotent, keeps foreign values, rejects transport confli
 });
 test('stdio launcher: clean stdout, protocol errors, actual hc failure, EOF and lock',{timeout:10000},async t => {
   const dir = await mkdtemp(join(tmpdir(),'worker-stdio-')); await mkdir(join(dir,'bin'));
+  const coreDirectory = join(dir,'herdr-core');
+  await mkdir(coreDirectory,{mode:0o755});
+  await chmod(coreDirectory,0o755);
+  await writeFile(join(coreDirectory,'unrelated-state'),'preserve');
   await writeFile(join(dir,'bin/hc'),'#!/bin/sh\necho private-stderr >&2\nexit 1\n'); await chmod(join(dir,'bin/hc'),0o755);
   const env = {...process.env,XDG_STATE_HOME:dir,HC_TERMINAL_ID:'t1',HC_PARENT:'t0',PATH:join(dir,'bin')+':'+process.env.PATH};
   const child = spawn(process.execPath,[resolve('dist/herdr-worker-mcp/launcher.mjs')],{env,stdio:['pipe','pipe','pipe']});
@@ -85,6 +90,14 @@ test('stdio launcher: clean stdout, protocol errors, actual hc failure, EOF and 
   const result = await request(3,'tools/call',{name:'report',arguments:{text:'x',requestId:'fail'}}); assert.equal(decode(result.result).error.code,'DELIVERY_UNKNOWN');
   assert.equal((await request(4,'unknown')).error.code,-32601);
   const exited = once(child,'exit'); child.stdin.end(); assert.equal((await exited)[0],0);
+  const directory = join(coreDirectory,'worker-mcp');
+  assert.equal((await stat(directory)).mode & 0o777,0o700);
+  const files = await readdir(directory);
+  assert.equal(files.filter(name => name.endsWith('.json')).length,1);
+  assert.equal(files.filter(name => name.endsWith('.lock')).length,1);
+  for (const name of files) assert.equal((await stat(join(directory,name))).mode & 0o777,0o600);
+  assert.equal((await stat(coreDirectory)).mode & 0o777,0o755);
+  assert.equal(await readFile(join(coreDirectory,'unrelated-state'),'utf8'),'preserve');
   assert.equal(stderr,''); assert.ok(stdout.trim().split('\n').every(line => JSON.parse(line).jsonrpc === '2.0'));
 });
 
@@ -207,4 +220,11 @@ test('installer preserves exact whitespace suffix after END and check accepts it
     assert.equal(write.status,0,write.stderr);
     assert.equal(await readFile(path,'utf8'),source);
   }
+});
+
+test('MCP state directory uses granted core subtree and supports explicit XDG root',() => {
+  const fallback = join(homedir(),'.local/state/herdr-core/worker-mcp');
+  assert.equal(stateDirectory({}),fallback);
+  assert.equal(stateDirectory({XDG_STATE_HOME:''}),fallback);
+  assert.equal(stateDirectory({XDG_STATE_HOME:'/tmp/custom-state'}),'/tmp/custom-state/herdr-core/worker-mcp');
 });
