@@ -160,3 +160,51 @@ test('managed installer preserves unrelated TOML bytes including float and int64
   const unmanaged = configured.replace('# BEGIN managed herdr-worker MCP\n','').replace('# END managed herdr-worker MCP\n','');
   assert.equal(configure(unmanaged,'/launcher'),unmanaged);
 });
+
+test('installer ignores marker examples in strings and comments, then installs and checks',async () => {
+  const begin = '# BEGIN managed herdr-worker MCP';
+  const end = '# END managed herdr-worker MCP';
+  const examples = [
+    `developer_instructions = """\nExample:\n${begin}\n${end}\n"""\n`,
+    `developer_instructions = '''\r\nExample:\r\n${begin}\r\n${end}\r\n'''\r\n`,
+    `# Guide mentions ${begin}\n`,
+    `# Guide mentions ${end}\n`,
+    `# Guide mentions ${begin}\n# Guide mentions ${end}\n`,
+  ];
+  const dir = await mkdtemp(join(tmpdir(),'worker-marker-examples-'));
+  const path = join(dir,'role.toml');
+  const run = (mode:string) => spawnSync(process.execPath,['scripts/install-worker-mcp.mjs',mode,path],{encoding:'utf8'});
+  for (const source of examples) {
+    const configured = configure(source,'/launcher');
+    assert.ok(configured.startsWith(source));
+    assert.equal(configure(configured,'/launcher'),configured);
+    const changed = configure(configured,'/changed-launcher');
+    assert.ok(changed.startsWith(source));
+    await writeFile(path,source);
+    assert.equal(run('--write').status,0);
+    const installed = await readFile(path,'utf8');
+    assert.ok(installed.startsWith(source));
+    assert.equal(run('--check').status,0);
+    assert.equal(run('--write').status,0);
+    assert.equal(await readFile(path,'utf8'),installed);
+  }
+  assert.throws(() => configure(`${begin}\n# missing end\n`),/last/);
+  assert.throws(() => configure(`${begin}\n[foreign]\nx=1\n${end}\n`),/Unowned/);
+  assert.throws(() => configure(`${begin}\n${begin}\n${end}\n`),/last/);
+});
+test('installer preserves exact whitespace suffix after END and check accepts it',async () => {
+  const dir = await mkdtemp(join(tmpdir(),'worker-marker-suffix-'));
+  const path = join(dir,'role.toml');
+  const generated = configure('float = 1.0\r\n');
+  for (const suffix of ['', '\n', '\r\n', '\n\r\n\r\n', '\r\n \t\r\n\r\n']) {
+    const source = generated.slice(0,generated.lastIndexOf('# END managed herdr-worker MCP')) + '# END managed herdr-worker MCP' + suffix;
+    assert.equal(configure(source),source);
+    assert.ok(configure(source,'/changed-launcher').endsWith('# END managed herdr-worker MCP'+suffix));
+    await writeFile(path,source);
+    const check = spawnSync(process.execPath,['scripts/install-worker-mcp.mjs','--check',path],{encoding:'utf8'});
+    assert.equal(check.status,0,check.stderr);
+    const write = spawnSync(process.execPath,['scripts/install-worker-mcp.mjs','--write',path],{encoding:'utf8'});
+    assert.equal(write.status,0,write.stderr);
+    assert.equal(await readFile(path,'utf8'),source);
+  }
+});

@@ -12,20 +12,40 @@ const parseConfig = source => parse(source,{integersAsBigInt:'asNeeded'});
 function checkConflicts(server) {
   if (server.url || server.args?.length || Object.hasOwn(server.env ?? {},'HC_PARENT') || Object.hasOwn(server.env ?? {},'HC_TERMINAL_ID') || server.disabled_tools?.some(name => ['report','ask_owner'].includes(name))) throw new Error('Conflicting herdr-worker configuration; resolve manually.');
 }
+function standaloneMarkers(source, marker) {
+  const positions = [];
+  let offset = 0;
+  for (const line of source.split('\n')) {
+    if (line.replace(/\r$/, '') === marker) {
+      try {
+        // An incomplete TOML prefix means this line belongs to a string or
+        // another multiline value, rather than a standalone marker comment.
+        parseConfig(source.slice(0,offset));
+        positions.push(offset);
+      } catch {}
+    }
+    offset += line.length + 1;
+  }
+  return positions;
+}
 export function configure(source, command = launcher) {
   const config = parseConfig(source);
   const server = config.mcp_servers?.['herdr-worker'];
   if (server) checkConflicts(server);
   const desired = {command,env_vars:['HC_TERMINAL_ID','HC_PARENT'],enabled:true,enabled_tools:['report','ask_owner'],tools:{report:{approval_mode:'approve'},ask_owner:{approval_mode:'approve'}}};
   let prefix = source;
-  const start = source.indexOf(begin);
-  if (start !== -1) {
-    // Validate the prefix separately: a marker inside a multiline string cannot
-    // become an edit boundary. Only a standalone trailing block is owned here.
-    if (start > 0 && source[start-1] !== '\n' || source.indexOf(begin,start+begin.length) !== -1 || !source.slice(start).trimEnd().endsWith(end)) throw new Error('Managed MCP block must be standalone and last in the file.');
+  let suffix = '\n';
+  const starts = standaloneMarkers(source,begin);
+  const start = starts[0];
+  if (start !== undefined) {
+    const endings = standaloneMarkers(source,end).filter(position => position > start);
+    if (starts.length !== 1 || endings.length !== 1) throw new Error('Managed MCP block must be standalone and last in the file.');
+    const afterEnd = endings[0] + end.length;
+    suffix = source.slice(afterEnd);
+    if (suffix.trim()) throw new Error('Managed MCP block must be standalone and last in the file.');
     prefix = source.slice(0,start);
     if (parseConfig(prefix).mcp_servers?.['herdr-worker']) throw new Error('herdr-worker is also configured outside the managed block.');
-    const block = parseConfig(source.slice(start));
+    const block = parseConfig(source.slice(start,afterEnd));
     const owned = block.mcp_servers?.['herdr-worker'];
     if (!owned || Object.keys(block).some(key => key !== 'mcp_servers') || Object.keys(block.mcp_servers).some(key => key !== 'herdr-worker') || Object.keys(owned).some(key => !Object.hasOwn(desired,key)) || Object.keys(owned.tools ?? {}).some(key => !['report','ask_owner'].includes(key)) || Object.values(owned.tools ?? {}).some(tool => Object.keys(tool).some(key => key !== 'approval_mode'))) throw new Error('Unowned settings in managed MCP block; move them outside before updating.');
   } else if (server) {
@@ -35,7 +55,7 @@ export function configure(source, command = launcher) {
     throw new Error('Existing unmanaged herdr-worker table: migrate it to the generated managed block before installation. No file was changed.');
   }
   if (prefix && !prefix.endsWith('\n')) prefix += '\n';
-  const updated = prefix + begin + '\n' + stringify({mcp_servers:{'herdr-worker':desired}}) + end + '\n';
+  const updated = prefix + begin + '\n' + stringify({mcp_servers:{'herdr-worker':desired}}) + end + suffix;
   parseConfig(updated);
   return updated;
 }
