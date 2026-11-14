@@ -13,3 +13,7 @@ for (const role of ['orchestrator','worker']) {
   await writeFile(modulePath,bundle.replace('var register =', 'const register ='));
   for (const name of ['.claude-plugin/plugin.json','hooks/hooks.json']) await copyFile(`mods/${role}/${name}`,`${output}/${name}`);
 }
+await build({entryPoints:['mcp/worker/src/main.ts'],outfile:'dist/herdr-worker-mcp/server.mjs',bundle:true,packages:'external',format:'esm',platform:'node',target:'node22'});
+await build({entryPoints:['mcp/worker/src/launcher.ts'],outfile:'dist/herdr-worker-mcp/launcher.mjs',bundle:true,format:'esm',platform:'node',target:'node22',banner:{js:'#!/usr/bin/env node'}});
+const { chmod } = await import('node:fs/promises');
+await chmod('dist/herdr-worker-mcp/launcher.mjs',0o755);
