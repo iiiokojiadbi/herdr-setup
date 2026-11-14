@@ -36,6 +36,51 @@ test('list filters children and finished records',async()=>{
   const {client}=fake([output({terminals:[child,{...child,address:'t3',parent:'other'},{...child,address:'t4',state:'finished'}]})]);
   const result=await client.list(); assert.equal(result.data.workers.length,1); assert.equal(result.data.workers[0].status,'idle');
 });
+test('list includeFinished adds finished children and keeps failed statuses visible',async()=>{
+  const finishedChild={...child,address:'t3',state:'finished',status:null,exit_code:0,reason:'exited'};
+  const blocked={...child,address:'t4',status:{app:'runner',state:'blocked'}};
+  const {client,calls}=fake([output({terminals:[child,finishedChild,blocked,{...finishedChild,address:'t5',parent:'other'}]})]);
+  const result=await client.list({includeFinished:true});
+  assert.deepEqual(result.data.workers.map((worker:any)=>worker.address),['t2','t3','t4']);
+  assert.equal(result.data.workers[1].state,'finished');assert.equal(result.data.workers[1].exitCode,0);assert.equal(result.data.workers[1].reason,'exited');
+  assert.equal(result.data.workers[2].status,'blocked');assert.ok(calls[0].args.includes('--all'));
+  const live=fake([output({terminals:[child,finishedChild]})]);await live.client.list();assert.equal(live.calls[0].args.includes('--all'),false);
+  const {client:invalid,calls:invalidCalls}=fake([]);assert.equal((await invalid.list({includeFinished:'yes' as any})).error.code,'INVALID_INPUT');assert.equal(invalidCalls.length,0);
+});
+test('list address returns one own child snapshot without waiting',async()=>{
+  const snapshot={...child,first_message:{sent:false,reason:'blocked'},exit_code:null,finished_ms:null,reason:null,signal:null};
+  const {client,calls}=fake([output(snapshot)]);
+  const result=await client.list({address:'t2'});
+  assert.equal(result.ok,true);assert.equal(result.data.worker.address,'t2');assert.equal(result.data.worker.status,'idle');
+  assert.deepEqual(result.data.worker.firstMessage,{sent:false,reason:'blocked'});
+  assert.deepEqual(calls.map((call:any)=>call.args[1]),['get']);
+  assert.ok(calls.every((call:any)=>!call.args.includes('wait')));
+});
+for (const state of ['error','blocked']) test(`snapshot preserves ${state} status`,async()=>{
+  const {client}=fake([output({...child,status:{app:'runner',state}})]);
+  const result=await client.list({address:'t2'});assert.equal(result.ok,true);assert.equal(result.data.worker.status,state);
+});
+test('finished snapshot requires includeFinished and preserves final fields',async()=>{
+  const finishedChild={...child,state:'finished',status:null,exit_code:0,finished_ms:123,reason:'exited',signal:null};
+  const guarded=fake([output(finishedChild)]);const refused=await guarded.client.list({address:'t2'});
+  assert.equal(refused.error.code,'FINISHED');assert.equal(refused.error.effect,'none');assert.match(refused.error.hint,/includeFinished/);
+  const allowed=fake([output(finishedChild)]);const result=await allowed.client.list({address:'t2',includeFinished:true});
+  assert.equal(result.ok,true);assert.equal(result.data.worker.state,'finished');assert.equal(result.data.worker.exitCode,0);assert.equal(result.data.worker.finishedMs,123);
+});
+test('address snapshot rejects another parent before returning data',async()=>{
+  const {client,calls}=fake([output({...child,parent:'other',state:'finished'})]);
+  const result=await client.list({address:'t2',includeFinished:true});assert.equal(result.error.code,'NOT_CHILD');assert.equal(calls.length,1);
+});
+test('missing address is a failure, not a finished worker',async()=>{
+  const {client}=fake([output({}, {exitCode:1,stderr:'{"error":{"kind":"not_found","message":"no terminal"}}'})]);
+  const result=await client.list({address:'ghost'});assert.equal(result.ok,false);assert.equal(result.error.code,'NOT_FOUND');
+});
+test('spawn and send results point at push reports and snapshots',async()=>{
+  const spawned=fake([output({...child,first_message:{sent:true}})]);const spawn=await spawned.client.spawn({name:'w',template:'runner',task:'x'});
+  assert.match(spawn.data.hint,/separate hc input/);assert.match(spawn.data.hint,/worker_list/);assert.match(spawn.data.hint,/do not prove success/);
+  const sent=fake([output(child),output({started:true})]);const send=await sent.client.send({address:'t2',text:'x'});
+  assert.match(send.data.hint,/separate hc input/);assert.match(send.data.hint,/worker_list/);assert.match(send.data.hint,/do not prove success/);
+});
 test('name resolves to ID and text stays one argument',async()=>{
   const {client,calls}=fake([output(child),output({started:true,turn:3})]);
   const result=await client.send({address:'named',text:'a\nb'});
@@ -146,9 +191,20 @@ function harness(register:any,env:Record<string,string>={}, options: any = {}) {
 }
 test('mods register only the matching role and no tools outside herdr',async()=>{
   for (const register of [ownerRegister,workerRegister]) {const h=harness(register);await h.start();assert.equal(h.tools.length,0)}
-  const owner=harness(ownerRegister,{HC_TERMINAL_ID:'t1'});await owner.start();assert.equal(owner.tools.length,7);assert.ok(owner.tools.every(tool=>tool.isDeferred===false));
+  const owner=harness(ownerRegister,{HC_TERMINAL_ID:'t1'});await owner.start();assert.equal(owner.tools.length,7);
+  assert.deepEqual(owner.tools.filter(tool=>tool.isDeferred).map(tool=>tool.name),['worker_wait']);
   const wrong=harness(ownerRegister,{HC_TERMINAL_ID:'t2',HC_PARENT:'t1'});await wrong.start();assert.equal(wrong.tools.length,0);
   const worker=harness(workerRegister,{HC_TERMINAL_ID:'t2',HC_PARENT:'t1'});await worker.start();assert.equal(worker.tools.length,2);
+});
+test('worker_wait is deferred diagnostic and does not invite a wait loop',async()=>{
+  const h=harness(ownerRegister,{HC_TERMINAL_ID:'t1'},{responses:[output({reason:'timeout'})],permission:'allow'});await h.start();
+  const wait=h.tools.find(tool=>tool.name==='worker_wait');
+  assert.equal(wait.isDeferred,true);assert.match(wait.description,/Blocking diagnostic/);assert.match(wait.description,/not the normal mode/);assert.match(wait.description,/separate hc input/);
+  const list=h.tools.find(tool=>tool.name==='worker_list');
+  assert.deepEqual(Object.keys(list.inputSchema.properties).sort(),['address','includeFinished']);
+  const result=await h.hooks.get('mcp__herdr-orchestrator__worker_wait')(h.$,{tool:'mcp__herdr-orchestrator__worker_wait',tool_use_id:'call'});
+  assert.equal(result.result.ok,true);assert.match(result.result.data.hint,/instead of waiting again/);
+  assert.doesNotMatch(result.result.data.hint,/then wait again|Wait again when needed/i);
 });
 test('permission ask and deny prevent subprocess, nested agents refused',async()=>{
   const h=harness(ownerRegister,{HC_TERMINAL_ID:'t1'});await h.start();const hook=h.hooks.get('mcp__herdr-orchestrator__worker_spawn');

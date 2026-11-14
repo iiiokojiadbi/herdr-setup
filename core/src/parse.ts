@@ -17,7 +17,7 @@ export function parse(result: RunResult, effect: Effect = 'none'): Data {
 }
 export function terminal(value: Data): Data {
   if (typeof value.address !== 'string' || !value.address || typeof value.state !== 'string') throw new Fault('INVALID_RESPONSE','Terminal address or state missing.');
-  return { address: value.address, name: value.name ?? null, template: value.template ?? null, parent: value.parent ?? null, state: value.state, status: typeof value.status === 'string' ? value.status : value.status?.state ?? null, cwd: value.cwd ?? null, turn: value.turn ?? null };
+  return { address: value.address, name: value.name ?? null, template: value.template ?? null, parent: value.parent ?? null, state: value.state, status: typeof value.status === 'string' ? value.status : value.status?.state ?? null, cwd: value.cwd ?? null, turn: value.turn ?? null, firstMessage: firstMessage(value) ?? null, exitCode: value.exit_code ?? null, finishedMs: value.finished_ms ?? null, reason: value.reason ?? null, signal: value.signal ?? null };
 }
 export function firstMessage(value: Data): Data | undefined {
   const message = value.first_message;

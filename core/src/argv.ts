@@ -5,7 +5,7 @@ export const argv = {
     for (const [key,value] of Object.entries(p.labels ?? {})) args.push('--label',`${key}=${value}`);
     return [...args, ...(p.command ? ['--',...p.command] : [p.template!,p.task!])];
   },
-  ls: () => ['ls','--json'],
+  ls: (includeFinished = false) => ['ls','--json', ...(includeFinished ? ['--all'] : [])],
   get: (address: string) => ['get','--json','--',address],
   send: (address: string, text: string) => ['send','--json','--',address,text],
   wait: (scope: {address?: string; children?: string}, timeoutMs: number) => ['wait','--json','--timeout',String(Math.ceil(timeoutMs / 1000)),...(scope.address ? ['--',scope.address] : ['--children',scope.children ?? 'any'])],

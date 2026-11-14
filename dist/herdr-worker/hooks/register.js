@@ -5,7 +5,7 @@ var argv = {
     for (const [key, value] of Object.entries(p.labels ?? {})) args.push("--label", `${key}=${value}`);
     return [...args, ...p.command ? ["--", ...p.command] : [p.template, p.task]];
   },
-  ls: () => ["ls", "--json"],
+  ls: (includeFinished = false) => ["ls", "--json", ...includeFinished ? ["--all"] : []],
   get: (address) => ["get", "--json", "--", address],
   send: (address, text2) => ["send", "--json", "--", address, text2],
   wait: (scope, timeoutMs) => ["wait", "--json", "--timeout", String(Math.ceil(timeoutMs / 1e3)), ...scope.address ? ["--", scope.address] : ["--children", scope.children ?? "any"]],
@@ -60,7 +60,7 @@ function parse(result, effect = "none") {
 }
 function terminal(value) {
   if (typeof value.address !== "string" || !value.address || typeof value.state !== "string") throw new Fault("INVALID_RESPONSE", "Terminal address or state missing.");
-  return { address: value.address, name: value.name ?? null, template: value.template ?? null, parent: value.parent ?? null, state: value.state, status: typeof value.status === "string" ? value.status : value.status?.state ?? null, cwd: value.cwd ?? null, turn: value.turn ?? null };
+  return { address: value.address, name: value.name ?? null, template: value.template ?? null, parent: value.parent ?? null, state: value.state, status: typeof value.status === "string" ? value.status : value.status?.state ?? null, cwd: value.cwd ?? null, turn: value.turn ?? null, firstMessage: firstMessage(value) ?? null, exitCode: value.exit_code ?? null, finishedMs: value.finished_ms ?? null, reason: value.reason ?? null, signal: value.signal ?? null };
 }
 function firstMessage(value) {
   const message = value.first_message;
@@ -146,6 +146,8 @@ function integer(value, min, max) {
   if (!Number.isInteger(value) || value < min || value > max) throw new Fault("INVALID_INPUT", "Integer outside allowed range.");
 }
 var finished = (state) => ["finished", "exited", "dead"].includes(state);
+var SPAWN_HINT = "Continue independent work. Worker reports, questions and emergency events arrive as separate hc input; call worker_list for a snapshot. done or idle do not prove success.";
+var SEND_HINT = "Continue independent work. The report arrives as separate hc input; call worker_list to verify state. done or idle do not prove success.";
 function createClient({ transport, context: context2, journal }) {
   let queue = Promise.resolve();
   let waiting = false;
@@ -276,12 +278,19 @@ ${input.text}`), "unknown");
       const data = { ...value, name, cwd, parent: context2.self, ...first ? { firstMessage: first } : {} };
       if (byTemplate && !first) return failure("INVALID_RESPONSE", "Missing first_message.", "applied", data);
       if (first?.sent === false) return failure("FIRST_MESSAGE_NOT_SENT", "Worker created; first task was not sent.", "applied", data, void 0, "Read the worker before sending its task.");
-      return success(data);
+      return success({ ...data, hint: SPAWN_HINT });
     }),
-    list: () => guarded("owner", async () => {
-      const value = await run(argv.ls());
+    list: (input = {}) => guarded("owner", async () => {
+      const includeFinished = input.includeFinished ?? false;
+      if (typeof includeFinished !== "boolean") throw new Fault("INVALID_INPUT", "Invalid includeFinished.");
+      if (input.address !== void 0) {
+        const item = await child(input.address);
+        if (!includeFinished && finished(item.state)) return failure("FINISHED", "Worker has finished.", "none", { address: item.address, state: item.state }, void 0, "Call worker_list with includeFinished: true for a final snapshot.");
+        return success({ worker: item });
+      }
+      const value = await run(argv.ls(includeFinished));
       if (!Array.isArray(value.terminals)) throw new Fault("INVALID_RESPONSE", "Missing terminals.");
-      return success({ workers: value.terminals.filter((item) => item.parent === context2.self && !finished(item.state)).map(terminal) });
+      return success({ workers: value.terminals.filter((item) => item.parent === context2.self && (includeFinished || !finished(item.state))).map(terminal) });
     }),
     send: (input) => guarded("owner", async () => {
       text(input.text, "text");
@@ -290,7 +299,7 @@ ${input.text}`), "unknown");
       if (finished(item.state)) return failure("FINISHED", "Worker has finished.");
       try {
         const value = await run(argv.send(item.address, input.text), "unknown");
-        return success({ address: item.address, delivery: "sent", observation: value });
+        return success({ address: item.address, delivery: "sent", observation: value, hint: SEND_HINT });
       } catch (error) {
         return failure("DELIVERY_UNKNOWN", "Delivery outcome is unknown.", "unknown", { address: item.address }, error instanceof Fault ? error.details ?? error.message : String(error));
       }
@@ -306,7 +315,7 @@ ${input.text}`), "unknown");
       try {
         const value = await run(argv.wait(scope, timeoutMs), "none", timeoutMs + 3e4);
         if (typeof value.reason !== "string") throw new Fault("INVALID_RESPONSE", "Missing wait reason.");
-        return success({ ...value, scope, observation: value.observation ?? { ...value, ...value.status !== void 0 ? { status: typeof value.status === "string" ? value.status : value.status?.state ?? null } : {} }, hint: value.reason === "message" ? "Read the incoming message, then wait again." : "Wait again when needed." });
+        return success({ ...value, scope, observation: value.observation ?? { ...value, ...value.status !== void 0 ? { status: typeof value.status === "string" ? value.status : value.status?.state ?? null } : {} }, hint: value.reason === "message" ? "A message arrived as separate input. Continue your current work; call worker_list for a snapshot instead of waiting again." : "No news is a normal check-in. Continue independent work; call worker_list for a snapshot instead of waiting again." });
       } finally {
         waiting = false;
       }

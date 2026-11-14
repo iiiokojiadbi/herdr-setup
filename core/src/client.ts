@@ -11,6 +11,8 @@ function integer(value: unknown, min: number, max: number): asserts value is num
   if (!Number.isInteger(value) || (value as number) < min || (value as number) > max) throw new Fault('INVALID_INPUT','Integer outside allowed range.');
 }
 const finished = (state: string) => ['finished','exited','dead'].includes(state);
+const SPAWN_HINT = 'Continue independent work. Worker reports, questions and emergency events arrive as separate hc input; call worker_list for a snapshot. done or idle do not prove success.';
+const SEND_HINT = 'Continue independent work. The report arrives as separate hc input; call worker_list to verify state. done or idle do not prove success.';
 export function createClient({ transport, context, journal }: {transport: Transport; context: Context; journal?: Journal}) {
   let queue: Promise<unknown> = Promise.resolve();
   let waiting = false;
@@ -118,18 +120,25 @@ export function createClient({ transport, context, journal }: {transport: Transp
       const data = {...value,name,cwd,parent:context.self,...(first ? {firstMessage:first} : {})};
       if (byTemplate && !first) return failure('INVALID_RESPONSE','Missing first_message.','applied',data);
       if (first?.sent === false) return failure('FIRST_MESSAGE_NOT_SENT','Worker created; first task was not sent.','applied',data,undefined,'Read the worker before sending its task.');
-      return success(data);
+      return success({...data,hint:SPAWN_HINT});
     }),
-    list: () => guarded('owner',async () => {
-      const value = await run(argv.ls());
+    list: (input: Data = {}) => guarded('owner',async () => {
+      const includeFinished = input.includeFinished ?? false;
+      if (typeof includeFinished !== 'boolean') throw new Fault('INVALID_INPUT','Invalid includeFinished.');
+      if (input.address !== undefined) {
+        const item = await child(input.address);
+        if (!includeFinished && finished(item.state)) return failure('FINISHED','Worker has finished.','none',{address:item.address,state:item.state},undefined,'Call worker_list with includeFinished: true for a final snapshot.');
+        return success({worker:item});
+      }
+      const value = await run(argv.ls(includeFinished));
       if (!Array.isArray(value.terminals)) throw new Fault('INVALID_RESPONSE','Missing terminals.');
-      return success({workers:value.terminals.filter((item: Data) => item.parent === context.self && !finished(item.state)).map(terminal)});
+      return success({workers:value.terminals.filter((item: Data) => item.parent === context.self && (includeFinished || !finished(item.state))).map(terminal)});
     }),
     send: (input: Data) => guarded('owner',async () => {
       text(input.text,'text'); const item = await child(input.address);
       if (item.status === 'blocked') return failure('BLOCKED','Worker is blocked.');
       if (finished(item.state)) return failure('FINISHED','Worker has finished.');
-      try { const value = await run(argv.send(item.address,input.text),'unknown'); return success({address:item.address,delivery:'sent',observation:value}); }
+      try { const value = await run(argv.send(item.address,input.text),'unknown'); return success({address:item.address,delivery:'sent',observation:value,hint:SEND_HINT}); }
       catch (error) { return failure('DELIVERY_UNKNOWN','Delivery outcome is unknown.','unknown',{address:item.address},error instanceof Fault ? error.details ?? error.message : String(error)); }
     }),
     wait: (input: Data = {}) => guarded('owner',async () => {
@@ -139,7 +148,7 @@ export function createClient({ transport, context, journal }: {transport: Transp
       const scope = input.address !== undefined ? {address:(await child(input.address)).address} : {children:input.children ?? 'any'};
       if (waiting) throw new Fault('INVALID_INPUT','Another wait is active.');
       waiting = true;
-      try { const value = await run(argv.wait(scope,timeoutMs),'none',timeoutMs+30000); if (typeof value.reason !== 'string') throw new Fault('INVALID_RESPONSE','Missing wait reason.'); return success({...value,scope,observation:value.observation ?? {...value,...(value.status !== undefined ? {status:typeof value.status === 'string' ? value.status : value.status?.state ?? null} : {})},hint:value.reason === 'message' ? 'Read the incoming message, then wait again.' : 'Wait again when needed.'}); }
+      try { const value = await run(argv.wait(scope,timeoutMs),'none',timeoutMs+30000); if (typeof value.reason !== 'string') throw new Fault('INVALID_RESPONSE','Missing wait reason.'); return success({...value,scope,observation:value.observation ?? {...value,...(value.status !== undefined ? {status:typeof value.status === 'string' ? value.status : value.status?.state ?? null} : {})},hint:value.reason === 'message' ? 'A message arrived as separate input. Continue your current work; call worker_list for a snapshot instead of waiting again.' : 'No news is a normal check-in. Continue independent work; call worker_list for a snapshot instead of waiting again.'}); }
       finally { waiting = false; }
     }),
     read: (input: Data) => guarded('owner',async () => {

@@ -5,7 +5,7 @@ var argv = {
     for (const [key, value] of Object.entries(p.labels ?? {})) args.push("--label", `${key}=${value}`);
     return [...args, ...p.command ? ["--", ...p.command] : [p.template, p.task]];
   },
-  ls: () => ["ls", "--json"],
+  ls: (includeFinished = false) => ["ls", "--json", ...includeFinished ? ["--all"] : []],
   get: (address) => ["get", "--json", "--", address],
   send: (address, text2) => ["send", "--json", "--", address, text2],
   wait: (scope, timeoutMs) => ["wait", "--json", "--timeout", String(Math.ceil(timeoutMs / 1e3)), ...scope.address ? ["--", scope.address] : ["--children", scope.children ?? "any"]],
@@ -60,7 +60,7 @@ function parse(result, effect = "none") {
 }
 function terminal(value) {
   if (typeof value.address !== "string" || !value.address || typeof value.state !== "string") throw new Fault("INVALID_RESPONSE", "Terminal address or state missing.");
-  return { address: value.address, name: value.name ?? null, template: value.template ?? null, parent: value.parent ?? null, state: value.state, status: typeof value.status === "string" ? value.status : value.status?.state ?? null, cwd: value.cwd ?? null, turn: value.turn ?? null };
+  return { address: value.address, name: value.name ?? null, template: value.template ?? null, parent: value.parent ?? null, state: value.state, status: typeof value.status === "string" ? value.status : value.status?.state ?? null, cwd: value.cwd ?? null, turn: value.turn ?? null, firstMessage: firstMessage(value) ?? null, exitCode: value.exit_code ?? null, finishedMs: value.finished_ms ?? null, reason: value.reason ?? null, signal: value.signal ?? null };
 }
 function firstMessage(value) {
   const message = value.first_message;
@@ -146,6 +146,8 @@ function integer(value, min, max) {
   if (!Number.isInteger(value) || value < min || value > max) throw new Fault("INVALID_INPUT", "Integer outside allowed range.");
 }
 var finished = (state) => ["finished", "exited", "dead"].includes(state);
+var SPAWN_HINT = "Continue independent work. Worker reports, questions and emergency events arrive as separate hc input; call worker_list for a snapshot. done or idle do not prove success.";
+var SEND_HINT = "Continue independent work. The report arrives as separate hc input; call worker_list to verify state. done or idle do not prove success.";
 function createClient({ transport, context: context2, journal }) {
   let queue = Promise.resolve();
   let waiting = false;
@@ -276,12 +278,19 @@ ${input.text}`), "unknown");
       const data = { ...value, name, cwd, parent: context2.self, ...first ? { firstMessage: first } : {} };
       if (byTemplate && !first) return failure("INVALID_RESPONSE", "Missing first_message.", "applied", data);
       if (first?.sent === false) return failure("FIRST_MESSAGE_NOT_SENT", "Worker created; first task was not sent.", "applied", data, void 0, "Read the worker before sending its task.");
-      return success(data);
+      return success({ ...data, hint: SPAWN_HINT });
     }),
-    list: () => guarded("owner", async () => {
-      const value = await run(argv.ls());
+    list: (input = {}) => guarded("owner", async () => {
+      const includeFinished = input.includeFinished ?? false;
+      if (typeof includeFinished !== "boolean") throw new Fault("INVALID_INPUT", "Invalid includeFinished.");
+      if (input.address !== void 0) {
+        const item = await child(input.address);
+        if (!includeFinished && finished(item.state)) return failure("FINISHED", "Worker has finished.", "none", { address: item.address, state: item.state }, void 0, "Call worker_list with includeFinished: true for a final snapshot.");
+        return success({ worker: item });
+      }
+      const value = await run(argv.ls(includeFinished));
       if (!Array.isArray(value.terminals)) throw new Fault("INVALID_RESPONSE", "Missing terminals.");
-      return success({ workers: value.terminals.filter((item) => item.parent === context2.self && !finished(item.state)).map(terminal) });
+      return success({ workers: value.terminals.filter((item) => item.parent === context2.self && (includeFinished || !finished(item.state))).map(terminal) });
     }),
     send: (input) => guarded("owner", async () => {
       text(input.text, "text");
@@ -290,7 +299,7 @@ ${input.text}`), "unknown");
       if (finished(item.state)) return failure("FINISHED", "Worker has finished.");
       try {
         const value = await run(argv.send(item.address, input.text), "unknown");
-        return success({ address: item.address, delivery: "sent", observation: value });
+        return success({ address: item.address, delivery: "sent", observation: value, hint: SEND_HINT });
       } catch (error) {
         return failure("DELIVERY_UNKNOWN", "Delivery outcome is unknown.", "unknown", { address: item.address }, error instanceof Fault ? error.details ?? error.message : String(error));
       }
@@ -306,7 +315,7 @@ ${input.text}`), "unknown");
       try {
         const value = await run(argv.wait(scope, timeoutMs), "none", timeoutMs + 3e4);
         if (typeof value.reason !== "string") throw new Fault("INVALID_RESPONSE", "Missing wait reason.");
-        return success({ ...value, scope, observation: value.observation ?? { ...value, ...value.status !== void 0 ? { status: typeof value.status === "string" ? value.status : value.status?.state ?? null } : {} }, hint: value.reason === "message" ? "Read the incoming message, then wait again." : "Wait again when needed." });
+        return success({ ...value, scope, observation: value.observation ?? { ...value, ...value.status !== void 0 ? { status: typeof value.status === "string" ? value.status : value.status?.state ?? null } : {} }, hint: value.reason === "message" ? "A message arrived as separate input. Continue your current work; call worker_list for a snapshot instead of waiting again." : "No news is a normal check-in. Continue independent work; call worker_list for a snapshot instead of waiting again." });
       } finally {
         waiting = false;
       }
@@ -368,10 +377,10 @@ const register = (on) => {
     const parent = await $.env.get("HC_PARENT");
     context = { self, parent, cwd: await $.session.cwd(), sessionId: await $.session.id() };
     if (!self || parent) return next(e);
-    await $.tool.register({ "name": "worker_spawn", "description": "Start a worker. Choose exactly one launch mode: template plus task, or command argv without template or task. cwd and worktree are mutually exclusive. A single command element must match ^[A-Za-z0-9._/-]+$; two or more elements remain separate argv. Never repeat an unknown spawn.", "inputSchema": { "type": "object", "properties": { "template": { "type": "string", "minLength": 1 }, "task": { "type": "string", "minLength": 1, "maxLength": 32768 }, "command": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 }, "name": { "type": "string", "pattern": "^[a-z0-9_-]{1,32}$" }, "cwd": { "type": "string", "minLength": 1 }, "worktree": { "type": "string", "minLength": 1 }, "labels": { "type": "object", "additionalProperties": { "type": "string" } } }, "additionalProperties": false }, "isDeferred": false });
-    await $.tool.register({ "name": "worker_list", "description": "List live children of this terminal.", "inputSchema": { "type": "object", "additionalProperties": false, "properties": {}, "required": [] }, "isDeferred": false });
-    await $.tool.register({ "name": "worker_send", "description": "Send a task to a child. Read before retrying a failed send.", "inputSchema": { "type": "object", "additionalProperties": false, "properties": { "address": { "type": "string", "minLength": 1, "maxLength": 256 }, "text": { "type": "string", "minLength": 1, "maxLength": 32768 } }, "required": ["address", "text"] }, "isDeferred": false });
-    await $.tool.register({ "name": "worker_wait", "description": "Wait for child activity. Timeout is a normal check-in. Default children any, 180 seconds.", "inputSchema": { "type": "object", "additionalProperties": false, "properties": { "address": { "type": "string", "minLength": 1, "maxLength": 256 }, "children": { "type": "string", "enum": ["any", "all"] }, "timeoutMs": { "type": "integer", "minimum": 1e3, "maximum": 54e4 } }, "required": [] }, "isDeferred": false });
+    await $.tool.register({ "name": "worker_spawn", "description": "Start a worker. Choose exactly one launch mode: template plus task, or command argv without template or task. cwd and worktree are mutually exclusive. A single command element must match ^[A-Za-z0-9._/-]+$; two or more elements remain separate argv. Never repeat an unknown spawn. Continue independent work after a spawn: worker reports, questions and emergency events arrive as separate hc input, and worker_list gives a non-blocking snapshot. done or idle do not prove success.", "inputSchema": { "type": "object", "properties": { "template": { "type": "string", "minLength": 1 }, "task": { "type": "string", "minLength": 1, "maxLength": 32768 }, "command": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 }, "name": { "type": "string", "pattern": "^[a-z0-9_-]{1,32}$" }, "cwd": { "type": "string", "minLength": 1 }, "worktree": { "type": "string", "minLength": 1 }, "labels": { "type": "object", "additionalProperties": { "type": "string" } } }, "additionalProperties": false }, "isDeferred": false });
+    await $.tool.register({ "name": "worker_list", "description": "Non-blocking snapshot of children, never waits. Without arguments lists live children of this terminal. address returns one own child snapshot; includeFinished true adds finished, exited and dead workers, and applies to the whole list too. Missing or not_found addresses are failures, not a successful finish.", "inputSchema": { "type": "object", "additionalProperties": false, "properties": { "address": { "type": "string", "minLength": 1, "maxLength": 256 }, "includeFinished": { "type": "boolean" } }, "required": [] }, "isDeferred": false });
+    await $.tool.register({ "name": "worker_send", "description": "Send a task to a child. Read before retrying a failed send. Continue independent work afterward: the report arrives as separate hc input, and worker_list gives a non-blocking snapshot. done or idle do not prove success.", "inputSchema": { "type": "object", "additionalProperties": false, "properties": { "address": { "type": "string", "minLength": 1, "maxLength": 256 }, "text": { "type": "string", "minLength": 1, "maxLength": 32768 } }, "required": ["address", "text"] }, "isDeferred": false });
+    await $.tool.register({ "name": "worker_wait", "description": "Blocking diagnostic only, not the normal mode. Waits for child activity or a message; do not call it in a loop. Normal operation is push: reports and emergency events arrive as separate hc input, and worker_list gives a non-blocking snapshot. Timeout is a normal check-in. Default children any, 180 seconds.", "inputSchema": { "type": "object", "additionalProperties": false, "properties": { "address": { "type": "string", "minLength": 1, "maxLength": 256 }, "children": { "type": "string", "enum": ["any", "all"] }, "timeoutMs": { "type": "integer", "minimum": 1e3, "maximum": 54e4 } }, "required": [] }, "isDeferred": true });
     await $.tool.register({ "name": "worker_read", "description": "Read child screen and history.", "inputSchema": { "type": "object", "additionalProperties": false, "properties": { "address": { "type": "string", "minLength": 1, "maxLength": 256 }, "lines": { "type": "integer", "minimum": 0, "maximum": 1e3 } }, "required": ["address"] }, "isDeferred": false });
     await $.tool.register({ "name": "worker_stop", "description": "End a worker only on explicit user request. Removal is optional.", "inputSchema": { "type": "object", "additionalProperties": false, "properties": { "address": { "type": "string", "minLength": 1, "maxLength": 256 }, "remove": { "type": "boolean" } }, "required": ["address"] }, "isDeferred": false });
     await $.tool.register({ "name": "worker_templates", "description": "List worker templates.", "inputSchema": { "type": "object", "additionalProperties": false, "properties": {}, "required": [] }, "isDeferred": false });
@@ -393,9 +402,9 @@ const register = (on) => {
     if (e.agentId || context.parent) return toolResult(failure("WRONG_ROLE", "Tool is unavailable in this role."));
     const input = Object.fromEntries(Object.entries(e).filter(([key]) => !["tool", "tool_use_id", "agentId", "requestMeta"].includes(key)));
     if (!input || typeof input !== "object" || Array.isArray(input)) return toolResult(failure("INVALID_INPUT", "Expected an input object."));
-    if (Object.keys(input).some((key) => ![].includes(key))) return toolResult(failure("INVALID_INPUT", "Unknown input field."));
+    if (Object.keys(input).some((key) => !["address", "includeFinished"].includes(key))) return toolResult(failure("INVALID_INPUT", "Unknown input field."));
     const client = createClient({ transport: adapter($), context });
-    return toolResult(await client.list());
+    return toolResult(await client.list(input));
   }).catch(() => toolResult(failure("HC_ERROR", "Tool handler failed.", "unknown")));
   on("tool.call", { tool: "mcp__herdr-orchestrator__worker_send" }, async ($, e) => {
     if (!context.self) return toolResult(failure("NOT_IN_HERDR", "No terminal address."));
